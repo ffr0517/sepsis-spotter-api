@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Use Posit Public Package Manager (binary builds for Ubuntu Jammy)
 ENV R_REPO=https://packagemanager.posit.co/cran/__linux__/jammy/latest
 
-# Install required R packages
-RUN R -e "options(repos=c(CRAN(Sys.getenv('R_REPO')))); install.packages(c( \
+# Install required R packages (NOTE: CRAN=… is a NAME, not a function)
+RUN R -e "options(repos = c(CRAN = Sys.getenv('R_REPO'))); install.packages(c( \
   'plumber','jsonlite','dplyr','workflows','parsnip','hardhat','tibble','rlang' \
 ))"
 

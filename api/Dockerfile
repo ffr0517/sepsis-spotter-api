@@ -7,8 +7,8 @@ RUN apt-get update && apt-get install -y \
 RUN R -e "install.packages(c('plumber','jsonlite','dplyr','workflows','parsnip','hardhat','tibble','rlang'), repos='https://cloud.r-project.org')"
 
 WORKDIR /app
-COPY plumber.R /app/plumber.R
+COPY plumber.r /app/plumber.r
 COPY models /app/models
 
 EXPOSE 8000
-CMD ["R", "-e", "pr <- plumber::plumb('plumber.R'); pr$run(host='0.0.0.0', port=8000)"]
+CMD ["R", "-e", "pr <- plumber::plumb('plumber.r'); pr$run(host='0.0.0.0', port=8000)"]

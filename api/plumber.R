@@ -32,19 +32,70 @@ get_num <- function(x, default) {
 get_required_outcomes <- function(obj) {
   wf <- if (inherits(obj, "workflow")) obj else obj$wf
   mold <- workflows::extract_mold(wf)
-  mold$blueprint$ptypes$outcomes  # named list/data.frame of outcome prototypes (e.g., "label")
+  mold$blueprint$ptypes$outcomes
 }
 
-add_outcome_stubs <- function(obj, df) {
+get_required_ids <- function(obj) {
+  wf <- if (inherits(obj, "workflow")) obj else obj$wf
+  mold <- workflows::extract_mold(wf)
+  ids_tbl <- try(mold$extras$roles$id, silent = TRUE)
+  if (inherits(ids_tbl, "try-error") || is.null(ids_tbl)) return(list())
+  # Build a prototype list for each id column (usually just "label")
+  out <- list()
+  for (nm in names(ids_tbl)) {
+    out[[nm]] <- vctrs::vec_ptype(ids_tbl[[nm]])
+  }
+  out
+}
+
+get_required_case_wts <- function(obj) {
+  wf <- if (inherits(obj, "workflow")) obj else obj$wf
+  mold <- workflows::extract_mold(wf)
+  cw_tbl <- try(mold$extras$roles$case_weights, silent = TRUE)
+  if (inherits(cw_tbl, "try-error") || is.null(cw_tbl)) return(list())
+  out <- list()
+  for (nm in names(cw_tbl)) {
+    out[[nm]] <- vctrs::vec_ptype(cw_tbl[[nm]])
+  }
+  out
+}
+
+add_role_stubs <- function(obj, df) {
+  n <- nrow(df)
+
+  # Outcomes (e.g., SFI_bin_severe)
   out_pt <- try(get_required_outcomes(obj), silent = TRUE)
-  if (!inherits(out_pt, "try-error") && !is.null(out_pt) && length(out_pt)) {
+  if (!inherits(out_pt, "try-error") && length(out_pt)) {
     for (nm in names(out_pt)) {
       if (!nm %in% names(df)) {
-        df[[nm]] <- vctrs::vec_init(out_pt[[nm]], n = nrow(df))  # NA with correct class/levels
+        df[[nm]] <- vctrs::vec_init(out_pt[[nm]], n)
         attr(df, "schema_added_outcomes") <- unique(c(attr(df, "schema_added_outcomes"), nm))
       }
     }
   }
+
+  # ID role (e.g., label)
+  id_pt <- get_required_ids(obj)
+  if (length(id_pt)) {
+    for (nm in names(id_pt)) {
+      if (!nm %in% names(df)) {
+        df[[nm]] <- vctrs::vec_init(id_pt[[nm]], n)
+        attr(df, "schema_added_ids") <- unique(c(attr(df, "schema_added_ids"), nm))
+      }
+    }
+  }
+
+  # Case weights role (rarely needed at predict, but make it safe)
+  cw_pt <- get_required_case_wts(obj)
+  if (length(cw_pt)) {
+    for (nm in names(cw_pt)) {
+      if (!nm %in% names(df)) {
+        df[[nm]] <- vctrs::vec_init(cw_pt[[nm]], n)
+        attr(df, "schema_added_case_wts") <- unique(c(attr(df, "schema_added_case_wts"), nm))
+      }
+    }
+  }
+
   df
 }
 
@@ -294,8 +345,8 @@ function(req, res) {
 
   # Align request schema to both workflows (adds missing cols, casts types)
   feats <- ensure_predictor_schema(list(v1_obj, v2_obj), feats_in)
-  feats <- add_outcome_stubs(v1_obj, feats)
-  feats <- add_outcome_stubs(v2_obj, feats)
+  feats <- add_role_stubs(v1_obj, feats)
+  feats <- add_role_stubs(v2_obj, feats)
 
   # --- Predict ---
   p1 <- try(predict_probs_safe(v1_obj, feats), silent = TRUE)

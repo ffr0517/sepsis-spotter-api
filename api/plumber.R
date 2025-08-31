@@ -409,19 +409,23 @@ function(req, res) {
     notes = list()
   )
 
-  jsonlite::toJSON(list(
-    v1 = list(prob = unname(v1_prob[1]), thr = eff_thr_v1),
-    v2 = list(prob = unname(v2_prob[1]), thr = eff_thr_v2),
-    s1_decision = as.character(cmb$decision[1]),
-    rule = cmb$rule[1],
-    warnings = list(
-      missing_predictors_filled_with_NA = unname(attr(feats, "schema_added")),
-      predictors_casted_to_expected_type = unname(attr(feats, "schema_casted"))
-    ),
-    current_info_sheet = sheet,
-    hash = "sha256:s1",
-    timing_ms = 0L
-  ), auto_unbox = TRUE)
+  resp <- list(
+  v1 = list(prob = unname(v1_prob[1]), thr = eff_thr_v1),
+  v2 = list(prob = unname(v2_prob[1]), thr = eff_thr_v2),
+  s1_decision = as.character(cmb$decision[1]),
+  rule = cmb$rule[1],
+  warnings = list(
+    missing_predictors_filled_with_NA = unname(attr(feats, "schema_added")),
+    predictors_casted_to_expected_type = unname(attr(feats, "schema_casted")),
+    schema_added_outcomes  = unname(attr(feats, "schema_added_outcomes")),
+    schema_added_ids       = unname(attr(feats, "schema_added_ids")),
+    schema_added_case_wts  = unname(attr(feats, "schema_added_case_wts"))
+  ),
+  current_info_sheet = sheet,
+  hash = "sha256:s1",
+  timing_ms = 0L
+)
+return(resp)  
 }
 
 

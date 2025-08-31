@@ -24,13 +24,18 @@ DEF_VETO_SOFT     <- 0.10
 DEF_V1_STRONG     <- 0.20
 DEF_LOW_V2_RESCUE <- 0.01
 
+get_num <- function(x, default) {
+  xnum <- suppressWarnings(as.numeric(x))
+  if (length(xnum) == 0L || is.na(xnum)) default else xnum
+}
+
 # Pull effective knobs from metas (fallback to defaults)
-eff_thr_v1        <- suppressWarnings(as.numeric(v1_meta$threshold));        if (is.na(eff_thr_v1))        eff_thr_v1        <- DEF_THR_V1
-eff_thr_v2        <- suppressWarnings(as.numeric(v2_meta$threshold));        if (is.na(eff_thr_v2))        eff_thr_v2        <- DEF_THR_V2
-eff_margin        <- suppressWarnings(as.numeric(v1_meta$margin));           if (is.na(eff_margin))        eff_margin        <- DEF_MARGIN
-eff_veto_soft     <- suppressWarnings(as.numeric(v2_meta$veto_soft));        if (is.na(eff_veto_soft))     eff_veto_soft     <- DEF_VETO_SOFT
-eff_v1_strong     <- suppressWarnings(as.numeric(v1_meta$v1_strong));        if (is.na(eff_v1_strong))     eff_v1_strong     <- DEF_V1_STRONG
-eff_low_v2_rescue <- suppressWarnings(as.numeric(v2_meta$low_v2_rescue));    if (is.na(eff_low_v2_rescue)) eff_low_v2_rescue <- DEF_LOW_V2_RESCUE
+eff_thr_v1        <- get_num(v1_meta$threshold,        DEF_THR_V1)
+eff_thr_v2        <- get_num(v2_meta$threshold,        DEF_THR_V2)
+eff_margin        <- get_num(v1_meta$margin,           DEF_MARGIN)
+eff_veto_soft     <- get_num(v2_meta$veto_soft,        DEF_VETO_SOFT)
+eff_v1_strong     <- get_num(v1_meta$v1_strong,        DEF_V1_STRONG)
+eff_low_v2_rescue <- get_num(v2_meta$low_v2_rescue,    DEF_LOW_V2_RESCUE)
 
 # ---------------------------------------------------------------------
 # Workflow helpers

@@ -30,16 +30,22 @@ get_num <- function(x, default) {
 }
 
 get_required_outcomes <- function(obj) {
-  wf <- NULL
-  if (inherits(obj, "workflow")) {
-    wf <- obj
-  } else if (is.list(obj) && !is.null(obj$wf) && inherits(obj$wf, "workflow")) {
-    wf <- obj$wf
-  } else {
-    stop("Object is not a trained workflow or wrapper containing $wf.")
-  }
+  wf <- if (inherits(obj, "workflow")) obj else obj$wf
   mold <- workflows::extract_mold(wf)
-  mold$blueprint$ptypes$outcomes
+  mold$blueprint$ptypes$outcomes  # named list/data.frame of outcome prototypes (e.g., "label")
+}
+
+add_outcome_stubs <- function(obj, df) {
+  out_pt <- try(get_required_outcomes(obj), silent = TRUE)
+  if (!inherits(out_pt, "try-error") && !is.null(out_pt) && length(out_pt)) {
+    for (nm in names(out_pt)) {
+      if (!nm %in% names(df)) {
+        df[[nm]] <- vctrs::vec_init(out_pt[[nm]], n = nrow(df))  # NA with correct class/levels
+        attr(df, "schema_added_outcomes") <- unique(c(attr(df, "schema_added_outcomes"), nm))
+      }
+    }
+  }
+  df
 }
 
 # Pull effective knobs from metas (fallback to defaults)
@@ -288,6 +294,8 @@ function(req, res) {
 
   # Align request schema to both workflows (adds missing cols, casts types)
   feats <- ensure_predictor_schema(list(v1_obj, v2_obj), feats_in)
+  feats <- add_outcome_stubs(v1_obj, feats)
+  feats <- add_outcome_stubs(v2_obj, feats)
 
   # --- Predict ---
   p1 <- try(predict_probs_safe(v1_obj, feats), silent = TRUE)

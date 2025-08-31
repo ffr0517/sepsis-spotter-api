@@ -1,6 +1,6 @@
 # Privacy Policy
 
-_Last updated: 31/08/2025
+Last updated: 31/08/2025
 
 This Privacy Policy describes how the **Sepsis-Spotter API** (“we,” “our,” “the API”) handles data submitted for prediction. By using this API, you agree to the practices outlined below. This policy should be read alongside the project’s [README](./README.md) and OpenAPI specification.
 

@@ -11,6 +11,47 @@ v1_meta <- readRDS("models/v1_meta.rds")
 v2_obj  <- readRDS("models/v2_model.rds")
 v2_meta <- readRDS("models/v2_meta.rds")
 
+# ---------- helpers ----------
+as_num <- function(x) suppressWarnings(as.numeric(x))
+
+coerce_schema <- function(feats) {
+  # Ensure all expected columns exist
+  needed <- c(
+    "age.months","sex","bgcombyn","adm.recent","wfaz","waste","stunt","cidysymp",
+    "prior.care","travel.time.bin","diarrhoeal","pneumo","sev.pneumo","ensapro",
+    "vomit.all","seiz","pfacleth","not.alert","danger.sign","hr.all","rr.all",
+    "oxy.ra","envhtemp","crt.long","parenteral_screen","SIRS_num"
+  )
+  for (nm in setdiff(needed, names(feats))) feats[[nm]] <- NA
+
+  # Coerce numeric-ish
+  num_cols <- c("age.months","bgcombyn","adm.recent","wfaz","waste","stunt","cidysymp",
+                "prior.care","diarrhoeal","pneumo","sev.pneumo","ensapro","vomit.all",
+                "seiz","pfacleth","not.alert","danger.sign","hr.all","rr.all","oxy.ra",
+                "envhtemp","crt.long","parenteral_screen","SIRS_num")
+  for (nm in intersect(num_cols, names(feats))) feats[[nm]] <- as_num(feats[[nm]])
+
+  # Coerce categoricals commonly seen in training
+  # If your recipe already handles character->factor, this is still safe.
+  feats$sex <- factor(feats$sex, levels = c("M","F"))
+  feats$travel.time.bin <- factor(
+    feats$travel.time.bin,
+    levels = c("0-30","31-60","61-120",">120") # adjust if your training used different bins
+  )
+
+  # Return a plain data.frame
+  tibble::as_tibble(feats)
+}
+
+predict_probs_safe <- function(obj, new_data) {
+  tryCatch({
+    predict(obj, new_data = new_data, type = "prob")
+  }, error = function(e) {
+    attr(e, "is_predict_error") <- TRUE
+    stop(e)
+  })
+}
+
 # Default thresholds from meta (fallbacks if missing)
 def_thr_v1 <- suppressWarnings(as.numeric(v1_meta$threshold)); if (is.na(def_thr_v1)) def_thr_v1 <- 0.025
 def_thr_v2 <- suppressWarnings(as.numeric(v2_meta$threshold)); if (is.na(def_thr_v2)) def_thr_v2 <- 0.20
@@ -118,65 +159,71 @@ coerce_features <- function(x) {
 #* @post /s1_infer
 function(req, res) {
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
+  feats_raw <- as.data.frame(body$features, stringsAsFactors = FALSE)
+  feats <- coerce_schema(feats_raw)
 
-  # Optional per-request overrides (body$params)
-  p <- body$params %||% list()
-  thr_v1    <- as.numeric(p$thr_v1    %||% def_thr_v1)
-  thr_v2    <- as.numeric(p$thr_v2    %||% def_thr_v2)
-  margin    <- as.numeric(p$margin    %||% def_margin)
-  veto_soft <- as.numeric(p$veto_soft %||% def_veto_soft)
-  v1_strong <- as.numeric(p$v1_strong %||% def_v1_strong)
-  low_v2_rescue <- as.numeric(p$low_v2_rescue %||% def_low_v2_rescue)
+  # Try predicting; if anything fails, return a 400 with details.
+  p1 <- try(predict_probs_safe(v1_obj, feats), silent = TRUE)
+  if (inherits(p1, "try-error")) {
+    res$status <- 400
+    return(list(
+      error = "V1 prediction failed",
+      message = as.character(p1),
+      received_schema = lapply(feats, function(x) c(class = paste(class(x), collapse=","), example = utils::head(x,1)))
+    ))
+  }
 
-  feats <- coerce_features(body$features)
+  p2 <- try(predict_probs_safe(v2_obj, feats), silent = TRUE)
+  if (inherits(p2, "try-error")) {
+    res$status <- 400
+    return(list(
+      error = "V2 prediction failed",
+      message = as.character(p2),
+      received_schema = lapply(feats, function(x) c(class = paste(class(x), collapse=","), example = utils::head(x,1)))
+    ))
+  }
 
-  # Predict probabilities
-  p1 <- predict_probs(v1_obj, feats) # expect .pred_Severe, .pred_Other
-  p2 <- predict_probs(v2_obj, feats) # expect .pred_NOTSevere, .pred_Other
+  v1_prob <- if (".pred_Severe" %in% names(p1)) p1$.pred_Severe else {
+    res$status <- 500; return(list(error = "v1 prob column .pred_Severe missing"))
+  }
+  v2_prob <- if (".pred_NOTSevere" %in% names(p2)) p2$.pred_NOTSevere else {
+    res$status <- 500; return(list(error = "v2 prob column .pred_NOTSevere missing"))
+  }
 
-  if (!all(c(".pred_Severe", ".pred_Other") %in% names(p1)))
-    stop("v1 prob columns missing (.pred_Severe/.pred_Other)")
-  if (!all(c(".pred_NOTSevere", ".pred_Other") %in% names(p2)))
-    stop("v2 prob columns missing (.pred_NOTSevere/.pred_Other)")
+  # Pull decision defaults from meta or use baked-in defaults
+  thr_v1    <- as.numeric(v1_meta$threshold %||% 0.025)
+  thr_v2    <- as.numeric(v2_meta$threshold %||% 0.20)
+  margin    <- as.numeric(v1_meta$margin    %||% 0.05)
+  veto_soft <- as.numeric(v2_meta$veto_soft %||% 0.10)
+  v1_strong <- as.numeric(v1_meta$v1_strong %||% 0.20)
+  low_v2_rescue <- as.numeric(v2_meta$low_v2_rescue %||% 0.01)
 
-  v1_prob <- p1$.pred_Severe
-  v2_prob <- p2$.pred_NOTSevere
-  delta   <- v1_prob - v2_prob
+  # Margin-aware combiner with low-V2 rescue
+  combine_v1_v2_margin <- function(v1_p, v2_p) {
+    out <- rep("Other", length(v1_p))
+    idx_notsev <- v2_p >= thr_v2
+    out[idx_notsev] <- "NOTSevere"
 
-  s1 <- combine_margin(
-    p1 = v1_prob, p2 = v2_prob,
-    thr_v1 = thr_v1, thr_v2 = thr_v2,
-    margin = margin, veto_soft = veto_soft,
-    v1_strong = v1_strong, low_v2_rescue = low_v2_rescue
-  )
+    idx_sev <- (v1_p >= thr_v1) &
+      ((v1_p - v2_p) >= margin) &
+      ((v2_p < veto_soft) | (v1_p >= v1_strong)) &
+      !idx_notsev
+    out[idx_sev] <- "Severe"
 
-  # Build response row-wise
-  out <- lapply(seq_len(nrow(feats)), function(i) {
-    list(
-      v1 = list(prob = unname(v1_prob[i]), thr = thr_v1),
-      v2 = list(prob = unname(v2_prob[i]), thr = thr_v2),
-      deltas = list(v1_minus_v2 = unname(delta[i])),
-      params = list(
-        margin = margin, veto_soft = veto_soft,
-        v1_strong = v1_strong, low_v2_rescue = low_v2_rescue
-      ),
-      s1_decision = unname(as.character(s1$decision[i])),
-      rule_fired  = unname(s1$rule[i])
-    )
-  })
+    # rescue: definitely-not-notSevere + above thr_v1
+    idx_rescue <- (v2_p < low_v2_rescue) & (v1_p >= thr_v1) & !idx_notsev
+    out[idx_rescue] <- "Severe"
+
+    factor(out, levels = c("Other","Severe","NOTSevere"))
+  }
+
+  s1_dec <- combine_v1_v2_margin(v1_prob, v2_prob)
 
   jsonlite::toJSON(list(
-    results = out,
-    meta = list(
-      sheet_version = 1L,
-      created_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
-      model_hash = "sha256:s1_margin_v1",
-      defaults = list(
-        thr_v1 = def_thr_v1, thr_v2 = def_thr_v2,
-        margin = def_margin, veto_soft = def_veto_soft,
-        v1_strong = def_v1_strong, low_v2_rescue = def_low_v2_rescue
-      )
-    )
+    v1 = list(prob = unname(v1_prob[1]), thr = thr_v1),
+    v2 = list(prob = unname(v2_prob[1]), thr = thr_v2),
+    decision_params = list(margin = margin, veto_soft = veto_soft, v1_strong = v1_strong, low_v2_rescue = low_v2_rescue),
+    s1_decision = as.character(s1_dec[1])
   ), auto_unbox = TRUE)
 }
 

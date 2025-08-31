@@ -79,62 +79,7 @@ curl -X POST http://localhost:8000/s1_infer \
           "SIRS_num": 1
         }
       }'
-
-**## Example Response**
-{
-  "probabilities": {
-    ".pred_Severe": 0.004,
-    ".pred_NOTSevere": 0.873
-  },
-  "decision": "NOTSevere",
-  "rule": "margin-clear",
-  "thresholds": {
-    "thr_v1": 0.025,
-    "thr_v2": 0.20
-  },
-  "warnings": ["Added NA stubs for missing predictors"],
-  "info": {
-    "hash": "c83e...f42",
-    "timing_ms": 132
   }
 }
 
-Installation and Deployment
-1. Clone Repository
 
-git clone https://github.com/<your-org>/sepsis-spotter.git
-cd sepsis-spotter
-2. Build Docker Image
-docker build -t sepsis-spotter-api -f api/Dockerfile .
-3. Run Container
-docker run -d -p 8000:8000 sepsis-spotter-api
-4. Verify
-Visit http://localhost:8000/healthz to confirm the API is running.
-Repository Structure
-api/
-  ├── plumber.R        # Main API script (loads models, endpoints, decision logic)
-  ├── Dockerfile       # Container build file
-  └── models/          # Serialized model workflows and metadata (RDS)
-
-sepsis-spotter-api.yaml  # OpenAPI specification for /s1_infer
-README.md                # This file
-PRIVACY_POLICY.md        # Privacy Policy
-Security and Privacy
-No persistent data storage. Payloads are processed in memory and discarded after inference.
-Minimal logging (endpoint calls, errors, timestamps).
-Users must secure deployments with HTTPS, authentication, and appropriate access control.
-Do not submit identifiable patient information.
-See PRIVACY_POLICY.md for details.
-Intended Use and Limitations
-For research and evaluation purposes only.
-Not validated for clinical deployment.
-Predictions are probabilistic estimates, not deterministic diagnoses.
-Model performance is dataset-specific; external generalization is not guaranteed.
-License
-This project is released under the MIT License.
-Please review dependency licenses (e.g., tidymodels, xgboost, plumber, Docker).
-Citation
-If you use Sepsis-Spotter in research, please cite the Spot Sepsis Study and this repository:
-[Insert citation once manuscript/preprint is available]
-Contact
-For questions, issues, or contributions, please open an issue on GitHub.

@@ -3,6 +3,7 @@ library(plumber)
 library(jsonlite)
 library(dplyr)
 library(workflows)
+library(rlang)
 
 # Models
 v1_obj  <- readRDS("models/v1_model.rds")
@@ -10,34 +11,73 @@ v1_meta <- readRDS("models/v1_meta.rds")
 v2_obj  <- readRDS("models/v2_model.rds")
 v2_meta <- readRDS("models/v2_meta.rds")
 
-thr_v1 <- as.numeric(v1_meta$threshold)
-thr_v2 <- as.numeric(v2_meta$threshold)
+# Default thresholds from meta (fallbacks if missing)
+def_thr_v1 <- suppressWarnings(as.numeric(v1_meta$threshold)); if (is.na(def_thr_v1)) def_thr_v1 <- 0.025
+def_thr_v2 <- suppressWarnings(as.numeric(v2_meta$threshold)); if (is.na(def_thr_v2)) def_thr_v2 <- 0.20
 
-# Trained workflow
+# Default margin logic knobs (your chosen settings)
+def_margin      <- 0.05
+def_veto_soft   <- 0.10
+def_v1_strong   <- 0.20
+def_low_v2_rescue <- 0.01
+
+# Trained workflow?
 is_trained_wf <- function(x) {
   inherits(x, "workflow") && tryCatch(workflows::is_trained_workflow(x), error = function(e) FALSE)
 }
 
 # Probability prediction
-predict_probs <- function(obj, new_data, severe_col = ".pred_Severe", notsev_col = ".pred_NOTSevere") {
+predict_probs <- function(obj, new_data) {
   if (is_trained_wf(obj)) {
-    p <- predict(obj, new_data = new_data, type = "prob")
-    return(p)
+    return(predict(obj, new_data = new_data, type = "prob"))
   }
-  # fallback 
   if (!is.null(obj$wf) && workflows::is_trained_workflow(obj$wf)) {
     return(predict(obj$wf, new_data = new_data, type = "prob"))
   }
   stop("Model object is not a trained workflow.")
 }
 
-combine_v1_v2 <- function(v1_call, v2_call) {
-  dplyr::case_when(
-    v1_call == "Severe"    & v2_call == "Other"     ~ "Severe",
-    v1_call == "Severe"    & v2_call == "NOTSevere" ~ "Severe",
-    v1_call == "Other"     & v2_call == "NOTSevere" ~ "NOTSevere",
-    v1_call == "Other"     & v2_call == "Other"     ~ "Other",
-    TRUE ~ "Other"
+# Margin-aware S1 combiner (vectorised)
+# Order:
+#   1) V2 clear to NOTSevere if p2 >= thr_v2
+#   2) Otherwise Severe if: (p1 >= thr_v1) & (p1 - p2 >= margin) &
+#      (p2 < veto_soft  OR p1 >= v1_strong  OR p2 < low_v2_rescue)
+#   3) Else Other
+combine_margin <- function(p1, p2,
+                           thr_v1    = def_thr_v1,
+                           thr_v2    = def_thr_v2,
+                           margin    = def_margin,
+                           veto_soft = def_veto_soft,
+                           v1_strong = def_v1_strong,
+                           low_v2_rescue = def_low_v2_rescue) {
+  n <- length(p1)
+  out  <- rep("Other", n)
+  rule <- rep("other_default", n)
+
+  # 1) NOTSevere by V2 threshold
+  idx_notsev <- p2 >= thr_v2
+  out[idx_notsev]  <- "NOTSevere"
+  rule[idx_notsev] <- "v2>=thr_v2"
+
+  # 2) Severe by V1 with margin & veto/override logic, only where not already NOTSevere
+  idx_cand <- !idx_notsev &
+    (p1 >= thr_v1) &
+    ((p1 - p2) >= margin) &
+    ( (p2 < veto_soft) | (p1 >= v1_strong) | (p2 < low_v2_rescue) )
+
+  out[idx_cand]  <- "Severe"
+  # Label which clause triggered (helpful for debugging)
+  rule[idx_cand] <- dplyr::case_when(
+    p2[idx_cand] < low_v2_rescue ~ "severe_low_v2_rescue",
+    p1[idx_cand] >= v1_strong    ~ "severe_v1_strong",
+    p2[idx_cand] < veto_soft     ~ "severe_v2_soft_veto",
+    TRUE                         ~ "severe_margin"
+  )
+
+  data.frame(
+    decision = factor(out, levels = c("Other","Severe","NOTSevere")),
+    rule     = rule,
+    stringsAsFactors = FALSE
   )
 }
 
@@ -52,14 +92,19 @@ function(req, res) {
 }
 
 #* @get /healthz
-function() list(ok = TRUE, service = "S1", thr_v1 = thr_v1, thr_v2 = thr_v2)
+function() list(
+  ok = TRUE, service = "S1",
+  defaults = list(
+    thr_v1 = def_thr_v1, thr_v2 = def_thr_v2,
+    margin = def_margin, veto_soft = def_veto_soft,
+    v1_strong = def_v1_strong, low_v2_rescue = def_low_v2_rescue
+  )
+)
 
-#* @post /s1_infer
-function(req, res) {
-  body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
-  feats <- as.data.frame(body$features, stringsAsFactors = FALSE)
+# Helper to coerce/complete features
+coerce_features <- function(x) {
+  feats <- as.data.frame(x, stringsAsFactors = FALSE)
 
-  # Ensure expected columns exist (NA if missing)
   needed <- c(
     "age.months","sex","bgcombyn","adm.recent","wfaz","waste","stunt","cidysymp",
     "prior.care","travel.time.bin","diarrhoeal","pneumo","sev.pneumo","ensapro",
@@ -67,41 +112,71 @@ function(req, res) {
     "oxy.ra","envhtemp","crt.long","parenteral_screen","SIRS_num"
   )
   for (nm in setdiff(needed, names(feats))) feats[[nm]] <- NA
+  feats
+}
 
-  p1 <- predict_probs(v1_obj, feats)
-  p2 <- predict_probs(v2_obj, feats)
+#* @post /s1_infer
+function(req, res) {
+  body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
 
-  # expect columns like .pred_Severe, .pred_Other, .pred_NOTSevere
-  v1_prob <- if (".pred_Severe" %in% names(p1)) p1$.pred_Severe else stop("v1 prob column .pred_Severe missing")
-  v2_prob <- if (".pred_NOTSevere" %in% names(p2)) p2$.pred_NOTSevere else stop("v2 prob column .pred_NOTSevere missing")
+  # Optional per-request overrides (body$params)
+  p <- body$params %||% list()
+  thr_v1    <- as.numeric(p$thr_v1    %||% def_thr_v1)
+  thr_v2    <- as.numeric(p$thr_v2    %||% def_thr_v2)
+  margin    <- as.numeric(p$margin    %||% def_margin)
+  veto_soft <- as.numeric(p$veto_soft %||% def_veto_soft)
+  v1_strong <- as.numeric(p$v1_strong %||% def_v1_strong)
+  low_v2_rescue <- as.numeric(p$low_v2_rescue %||% def_low_v2_rescue)
 
-  v1_call <- ifelse(v1_prob >= thr_v1, "Severe", "Other")
-  v2_call <- ifelse(v2_prob >= thr_v2, "NOTSevere", "Other")
-  s1_dec  <- combine_v1_v2(v1_call, v2_call)
+  feats <- coerce_features(body$features)
 
-  sheet <- list(
-    sheet_version = 1L,
-    created_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
-    patient = list(anon_id = paste0(as.hexmode(sample(0:255, 8, TRUE)), collapse="")),
-    context = list(),
-    features = list(clinical = body$features, labs = list()),
-    s1 = list(
-      v1 = list(prob = unname(v1_prob[1]), thr = thr_v1, call = v1_call[1]),
-      v2 = list(prob = unname(v2_prob[1]), thr = thr_v2, call = v2_call[1]),
-      decision = s1_dec[1],
-      model_hash = "sha256:s1"
-    ),
-    notes = list()
+  # Predict probabilities
+  p1 <- predict_probs(v1_obj, feats) # expect .pred_Severe, .pred_Other
+  p2 <- predict_probs(v2_obj, feats) # expect .pred_NOTSevere, .pred_Other
+
+  if (!all(c(".pred_Severe", ".pred_Other") %in% names(p1)))
+    stop("v1 prob columns missing (.pred_Severe/.pred_Other)")
+  if (!all(c(".pred_NOTSevere", ".pred_Other") %in% names(p2)))
+    stop("v2 prob columns missing (.pred_NOTSevere/.pred_Other)")
+
+  v1_prob <- p1$.pred_Severe
+  v2_prob <- p2$.pred_NOTSevere
+  delta   <- v1_prob - v2_prob
+
+  s1 <- combine_margin(
+    p1 = v1_prob, p2 = v2_prob,
+    thr_v1 = thr_v1, thr_v2 = thr_v2,
+    margin = margin, veto_soft = veto_soft,
+    v1_strong = v1_strong, low_v2_rescue = low_v2_rescue
   )
 
+  # Build response row-wise
+  out <- lapply(seq_len(nrow(feats)), function(i) {
+    list(
+      v1 = list(prob = unname(v1_prob[i]), thr = thr_v1),
+      v2 = list(prob = unname(v2_prob[i]), thr = thr_v2),
+      deltas = list(v1_minus_v2 = unname(delta[i])),
+      params = list(
+        margin = margin, veto_soft = veto_soft,
+        v1_strong = v1_strong, low_v2_rescue = low_v2_rescue
+      ),
+      s1_decision = unname(as.character(s1$decision[i])),
+      rule_fired  = unname(s1$rule[i])
+    )
+  })
+
   jsonlite::toJSON(list(
-    v1 = list(prob = unname(v1_prob[1]), thr = thr_v1, call = v1_call[1]),
-    v2 = list(prob = unname(v2_prob[1]), thr = thr_v2, call = v2_call[1]),
-    s1_decision = s1_dec[1],
-    explanations = list(),
-    warnings = list(),
-    current_info_sheet = sheet,
-    hash = "sha256:s1",
-    timing_ms = 0L
+    results = out,
+    meta = list(
+      sheet_version = 1L,
+      created_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+      model_hash = "sha256:s1_margin_v1",
+      defaults = list(
+        thr_v1 = def_thr_v1, thr_v2 = def_thr_v2,
+        margin = def_margin, veto_soft = def_veto_soft,
+        v1_strong = def_v1_strong, low_v2_rescue = def_low_v2_rescue
+      )
+    )
   ), auto_unbox = TRUE)
 }
+

@@ -1,0 +1,146 @@
+openapi: 3.1.0
+info:
+  title: Sepsis Spotter API
+  description: Predicts sepsis severity based on clinical features. Accepts clinical input and returns inference with probabilities and decisions.
+  version: 1.0.0
+servers:
+  - url: https://sepsis-spotter-beta.onrender.com
+    description: Production server
+
+paths:
+  /s1_infer:
+    post:
+      operationId: predictSepsisSeverity
+      summary: Run sepsis severity inference based on clinical features
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                features:
+                  type: object
+                  description: Patient clinical features
+                  properties:
+                    age.months:
+                      type: number
+                    sex:
+                      type: integer
+                    bgcombyn:
+                      type: integer
+                    adm.recent:
+                      type: integer
+                    wfaz:
+                      type: number
+                    waste:
+                      type: integer
+                    stunt:
+                      type: integer
+                    cidysymp:
+                      type: integer
+                    prior.care:
+                      type: integer
+                    travel.time.bin:
+                      type: integer
+                    diarrhoeal:
+                      type: integer
+                    pneumo:
+                      type: integer
+                    sev.pneumo:
+                      type: integer
+                    ensapro:
+                      type: integer
+                    vomit.all:
+                      type: integer
+                    seiz:
+                      type: integer
+                    pfacleth:
+                      type: integer
+                    not.alert:
+                      type: integer
+                    danger.sign:
+                      type: integer
+                    hr.all:
+                      type: number
+                    rr.all:
+                      type: number
+                    oxy.ra:
+                      type: number
+                    envhtemp:
+                      type: number
+                    crt.long:
+                      type: integer
+                    parenteral_screen:
+                      type: integer
+                    SIRS_num:
+                      type: integer
+                  required:
+                    - age.months
+                    - sex
+                    - bgcombyn
+                    - adm.recent
+                    - wfaz
+                    - waste
+                    - stunt
+                    - cidysymp
+                    - prior.care
+                    - travel.time.bin
+                    - diarrhoeal
+                    - pneumo
+                    - sev.pneumo
+                    - ensapro
+                    - vomit.all
+                    - seiz
+                    - pfacleth
+                    - not.alert
+                    - danger.sign
+                    - hr.all
+                    - rr.all
+                    - oxy.ra
+                    - envhtemp
+                    - crt.long
+                    - parenteral_screen
+                    - SIRS_num
+      responses:
+        '200':
+          description: Sepsis severity prediction result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  v1:
+                    type: object
+                    properties:
+                      prob:
+                        type: array
+                        items:
+                          type: number
+                      thr:
+                        type: array
+                        items:
+                          type: number
+                  v2:
+                    type: object
+                    properties:
+                      prob:
+                        type: array
+                        items:
+                          type: number
+                      thr:
+                        type: array
+                        items:
+                          type: number
+                  s1_decision:
+                    type: array
+                    items:
+                      type: string
+                  rule:
+                    type: array
+                    items:
+                      type: string
+                  warnings:
+                    type: object
+                  current_info_sheet:
+                    type: object

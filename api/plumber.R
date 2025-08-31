@@ -67,7 +67,15 @@ predict_probs_safe <- function(obj, new_data) {
 # ---------------------------------------------------------------------
 # Schema guard: align request to each workflow's expected predictor ptypes
 # ---------------------------------------------------------------------
-get_required_ptypes <- function(wf) {
+get_required_ptypes <- function(obj) {
+  wf <- NULL
+  if (inherits(obj, "workflow")) {
+    wf <- obj
+  } else if (is.list(obj) && !is.null(obj$wf) && inherits(obj$wf, "workflow")) {
+    wf <- obj$wf
+  } else {
+    stop("Object is not a trained workflow or wrapper containing $wf.")
+  }
   mold <- workflows::extract_mold(wf)
   mold$blueprint$ptypes$predictors
 }
@@ -83,30 +91,95 @@ union_required_ptypes <- function(models) {
 
 ensure_predictor_schema <- function(models, new_data) {
   if (!is.list(models)) models <- list(models)
-  req <- union_required_ptypes(models)
+
+  # Union of required predictor ptypes (last one wins on duplicate names)
+  req_list <- lapply(models, get_required_ptypes)
+  req <- list()
+  for (pt in req_list) for (nm in names(pt)) req[[nm]] <- pt[[nm]]
+
   n <- nrow(new_data)
-  added <- character()
+  added  <- character()
   casted <- character()
 
+  # Ensure all expected columns exist
+  miss <- setdiff(names(req), names(new_data))
+  if (length(miss)) {
+    for (nm in miss) new_data[[nm]] <- vctrs::vec_init(req[[nm]], n = n)
+    added <- miss
+  }
+
+  # Order columns to match ptypes (good hygiene; not strictly required)
+  new_data <- new_data[, names(req), drop = FALSE]
+
+  # Helper to normalize many binary encodings
+  to_bin_char <- function(x) {
+    if (is.factor(x)) x <- as.character(x)
+    if (is.logical(x)) return(ifelse(isTRUE(x), "1", "0"))
+    x <- trimws(tolower(as.character(x)))
+    ifelse(x %in% c("1","true","t","yes","y","m","male"), "1",
+      ifelse(x %in% c("0","false","f","no","n","female","fem"), "0", x))
+  }
+
+  # Cast each col to prototype class (with factor-level awareness)
   for (nm in names(req)) {
-    ptype <- req[[nm]]
-    if (!nm %in% names(new_data)) {
-      new_data[[nm]] <- vctrs::vec_init(ptype, n = n)
-      added <- c(added, nm)
-    } else {
-      # Try casting; if it fails, leave as-is (recipe may still handle)
-      ok <- try({
-        new_data[[nm]] <- vctrs::vec_cast(new_data[[nm]], ptype, x_arg = nm, to_arg = paste(class(ptype), collapse = "/"))
+    proto <- req[[nm]]
+    x     <- new_data[[nm]]
+
+    if (is.factor(proto)) {
+      lv <- levels(proto)
+
+      # Make strings first
+      if (is.numeric(x) || is.integer(x) || is.logical(x)) x <- to_bin_char(x)
+      x <- trimws(as.character(x))
+
+      if (length(lv) == 2L) {
+        # Binary factor in training: map a wide range of encodings to the two levels.
+        low  <- lv[1]; high <- lv[2]
+        if (all(c("0","1") %in% lv)) {
+          # Training used "0"/"1" labels
+          x <- ifelse(x %in% c("0","1"), x, NA_character_)
+        } else {
+          # Training used something like c("No","Yes") or c("F","M")
+          x <- ifelse(x == "0", low,
+               ifelse(x == "1", high, x))
+        }
+      }
+
+      new_x <- factor(ifelse(x %in% lv, x, NA_character_), levels = lv)
+
+      # Track cast if class actually changed
+      if (!identical(class(new_data[[nm]]), class(new_x))) casted <- c(casted, nm)
+      new_data[[nm]] <- new_x
+
+    } else if (is.numeric(proto)) {
+      if (!is.numeric(x)) {
+        new_data[[nm]] <- suppressWarnings(as.numeric(x))
         casted <- c(casted, nm)
-      }, silent = TRUE)
-      if (inherits(ok, "try-error")) {
-        # no-op; we still carry the column as sent
+      }
+
+    } else if (is.integer(proto)) {
+      if (!is.integer(x)) {
+        new_data[[nm]] <- suppressWarnings(as.integer(x))
+        casted <- c(casted, nm)
+      }
+
+    } else if (is.logical(proto)) {
+      if (!is.logical(x)) {
+        xl <- tolower(as.character(x))
+        new_data[[nm]] <- xl %in% c("1","true","t","yes","y")
+        casted <- c(casted, nm)
+      }
+
+    } else if (is.character(proto)) {
+      if (!is.character(x)) {
+        new_data[[nm]] <- as.character(x)
+        casted <- c(casted, nm)
       }
     }
   }
 
   attr(new_data, "schema_added")  <- added
-  attr(new_data, "schema_casted") <- casted
+  attr(new_data, "schema_casted") <- unique(casted)
   new_data
 }
 

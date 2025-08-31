@@ -29,6 +29,19 @@ get_num <- function(x, default) {
   if (length(xnum) == 0L || is.na(xnum)) default else xnum
 }
 
+get_required_outcomes <- function(obj) {
+  wf <- NULL
+  if (inherits(obj, "workflow")) {
+    wf <- obj
+  } else if (is.list(obj) && !is.null(obj$wf) && inherits(obj$wf, "workflow")) {
+    wf <- obj$wf
+  } else {
+    stop("Object is not a trained workflow or wrapper containing $wf.")
+  }
+  mold <- workflows::extract_mold(wf)
+  mold$blueprint$ptypes$outcomes
+}
+
 # Pull effective knobs from metas (fallback to defaults)
 eff_thr_v1        <- get_num(v1_meta$threshold,        DEF_THR_V1)
 eff_thr_v2        <- get_num(v2_meta$threshold,        DEF_THR_V2)
@@ -92,26 +105,40 @@ union_required_ptypes <- function(models) {
 ensure_predictor_schema <- function(models, new_data) {
   if (!is.list(models)) models <- list(models)
 
-  # Union of required predictor ptypes (last one wins on duplicate names)
-  req_list <- lapply(models, get_required_ptypes)
-  req <- list()
-  for (pt in req_list) for (nm in names(pt)) req[[nm]] <- pt[[nm]]
+  # ---- Collect predictor ptypes (last wins on name clashes)
+  req_pred_list <- lapply(models, get_required_ptypes)
+  req_pred <- list(); for (pt in req_pred_list) for (nm in names(pt)) req_pred[[nm]] <- pt[[nm]]
+
+  # ---- Collect outcome ptypes (e.g., 'label') if any
+  req_out_list <- lapply(models, function(m) {
+    out <- try(get_required_outcomes(m), silent = TRUE)
+    if (inherits(out, "try-error") || is.null(out)) list() else out
+  })
+  req_out <- list(); for (pt in req_out_list) for (nm in names(pt)) req_out[[nm]] <- pt[[nm]]
 
   n <- nrow(new_data)
-  added  <- character()
-  casted <- character()
+  added_pred  <- character()
+  added_out   <- character()
+  casted_pred <- character()
 
-  # Ensure all expected columns exist
-  miss <- setdiff(names(req), names(new_data))
-  if (length(miss)) {
-    for (nm in miss) new_data[[nm]] <- vctrs::vec_init(req[[nm]], n = n)
-    added <- miss
+  # Ensure all expected predictor cols exist
+  miss_pred <- setdiff(names(req_pred), names(new_data))
+  if (length(miss_pred)) {
+    for (nm in miss_pred) new_data[[nm]] <- vctrs::vec_init(req_pred[[nm]], n = n)
+    added_pred <- miss_pred
   }
 
-  # Order columns to match ptypes (good hygiene; not strictly required)
-  new_data <- new_data[, names(req), drop = FALSE]
+  # Ensure all expected outcome cols (e.g., 'label') exist — set to NA prototype
+  miss_out <- setdiff(names(req_out), names(new_data))
+  if (length(miss_out)) {
+    for (nm in miss_out) new_data[[nm]] <- vctrs::vec_init(req_out[[nm]], n = n)
+    added_out <- miss_out
+  }
 
-  # Helper to normalize many binary encodings
+  # Order predictors to match ptypes (nice-to-have)
+  new_data <- new_data[, unique(c(names(req_pred), names(new_data))), drop = FALSE]
+
+  # Helper to normalize many binary encodings to "0"/"1"
   to_bin_char <- function(x) {
     if (is.factor(x)) x <- as.character(x)
     if (is.logical(x)) return(ifelse(isTRUE(x), "1", "0"))
@@ -120,66 +147,49 @@ ensure_predictor_schema <- function(models, new_data) {
       ifelse(x %in% c("0","false","f","no","n","female","fem"), "0", x))
   }
 
-  # Cast each col to prototype class (with factor-level awareness)
-  for (nm in names(req)) {
-    proto <- req[[nm]]
+  # Cast predictors to prototype classes/levels
+  for (nm in names(req_pred)) {
+    proto <- req_pred[[nm]]
     x     <- new_data[[nm]]
 
     if (is.factor(proto)) {
       lv <- levels(proto)
-
-      # Make strings first
       if (is.numeric(x) || is.integer(x) || is.logical(x)) x <- to_bin_char(x)
       x <- trimws(as.character(x))
 
       if (length(lv) == 2L) {
-        # Binary factor in training: map a wide range of encodings to the two levels.
-        low  <- lv[1]; high <- lv[2]
+        low <- lv[1]; high <- lv[2]
         if (all(c("0","1") %in% lv)) {
-          # Training used "0"/"1" labels
           x <- ifelse(x %in% c("0","1"), x, NA_character_)
         } else {
-          # Training used something like c("No","Yes") or c("F","M")
-          x <- ifelse(x == "0", low,
-               ifelse(x == "1", high, x))
+          x <- ifelse(x == "0", low, ifelse(x == "1", high, x))
         }
       }
-
       new_x <- factor(ifelse(x %in% lv, x, NA_character_), levels = lv)
-
-      # Track cast if class actually changed
-      if (!identical(class(new_data[[nm]]), class(new_x))) casted <- c(casted, nm)
+      if (!identical(class(new_data[[nm]]), class(new_x))) casted_pred <- c(casted_pred, nm)
       new_data[[nm]] <- new_x
 
     } else if (is.numeric(proto)) {
-      if (!is.numeric(x)) {
-        new_data[[nm]] <- suppressWarnings(as.numeric(x))
-        casted <- c(casted, nm)
-      }
+      if (!is.numeric(x)) { new_data[[nm]] <- suppressWarnings(as.numeric(x)); casted_pred <- c(casted_pred, nm) }
 
     } else if (is.integer(proto)) {
-      if (!is.integer(x)) {
-        new_data[[nm]] <- suppressWarnings(as.integer(x))
-        casted <- c(casted, nm)
-      }
+      if (!is.integer(x)) { new_data[[nm]] <- suppressWarnings(as.integer(x)); casted_pred <- c(casted_pred, nm) }
 
     } else if (is.logical(proto)) {
       if (!is.logical(x)) {
         xl <- tolower(as.character(x))
         new_data[[nm]] <- xl %in% c("1","true","t","yes","y")
-        casted <- c(casted, nm)
+        casted_pred <- c(casted_pred, nm)
       }
 
     } else if (is.character(proto)) {
-      if (!is.character(x)) {
-        new_data[[nm]] <- as.character(x)
-        casted <- c(casted, nm)
-      }
+      if (!is.character(x)) { new_data[[nm]] <- as.character(x); casted_pred <- c(casted_pred, nm) }
     }
   }
 
-  attr(new_data, "schema_added")  <- added
-  attr(new_data, "schema_casted") <- unique(casted)
+  attr(new_data, "schema_added")            <- added_pred
+  attr(new_data, "schema_added_outcomes")   <- added_out
+  attr(new_data, "schema_casted")           <- unique(casted_pred)
   new_data
 }
 
@@ -253,16 +263,16 @@ function() list(
 
 #* @get /schema
 function() {
-  fmt <- function(wf) {
-    pt <- get_required_ptypes(wf)
-    data.frame(
-      name = names(pt),
-      type = vapply(pt, function(x) paste(class(x), collapse = "/"), ""),
-      stringsAsFactors = FALSE
+  fmt <- function(obj) {
+    ptp <- get_required_ptypes(obj)
+    out <- try(get_required_outcomes(obj), silent = TRUE)
+    list(
+      predictors = data.frame(name = names(ptp), type = vapply(ptp, function(x) paste(class(x), collapse="/"), "")),
+      outcomes   = if (inherits(out, "try-error") || is.null(out)) NULL else
+        data.frame(name = names(out), type = vapply(out, function(x) paste(class(x), collapse="/"), ""))
     )
   }
-  list(v1_predictors = fmt(v1_obj),
-       v2_predictors = fmt(v2_obj))
+  list(v1 = fmt(v1_obj), v2 = fmt(v2_obj))
 }
 
 # ---------------------------------------------------------------------

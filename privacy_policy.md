@@ -2,7 +2,7 @@
 
 Last updated: 31/08/2025
 
-This Privacy Policy describes how the **Sepsis-Spotter API** (“we,” “our,” “the API”) handles data submitted for prediction. By using this API, you agree to the practices outlined below. This policy should be read alongside the project’s [README](./README.md) and OpenAPI specification.
+This Privacy Policy describes how the **Sepsis-Spotter API** (“we,” “our,” “the API”) handles data submitted for prediction. By using this API, you agree to the practices outlined below. This policy should be read alongside the project’s [README](./README.md).
 
 ---
 
@@ -16,7 +16,7 @@ This API is intended **solely for research, development, and evaluation purposes
 ## 2. Data Submitted by Users
 When calling the `/s1_infer` endpoint, users may provide a JSON payload containing clinical, demographic, and contextual predictors (e.g., age, vital signs, symptoms).  
 
-- **Required/Optional Inputs:** Defined by the OpenAPI schema (`sepsis-spotter-api.yaml`).  
+- **Required/Optional Inputs:** Defined by the schema (`sepsis-spotter-api.yaml`).  
 - **Normalization:** Inputs are automatically type-cast, missing predictors are inserted with `NA` stubs, and schema adjustments may be reported back in the response.  
 - **No Direct Identifiers:** The schema does not require patient names, addresses, or personal identifiers. Any submission of personally identifiable information (PII) is the responsibility of the API user and is discouraged.  
 

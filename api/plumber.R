@@ -235,22 +235,26 @@ cast_to_ptypes <- function(df, ptypes) {
 
 predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   stopifnot(!is.null(fit$prep), !is.null(fit$bst))
-  # If predictor_ptypes exist, cast before baking (helps recipes step_unknown/novel)
   if (!is.null(fit$predictor_ptypes)) {
     new_data <- cast_to_ptypes(new_data, fit$predictor_ptypes)
   }
+
   baked <- bake(fit$prep, new_data = new_data)
 
-  # Align columns to training features
+  # Align to training feature vector
   feats <- fit$features
   miss <- setdiff(feats, names(baked))
   if (length(miss)) for (mc in miss) baked[[mc]] <- 0
   baked <- baked[, feats, drop = FALSE]
 
-  X <- Matrix::as(as.matrix(baked), "dgCMatrix")
+  # ---- BUILD SPARSE WITHOUT DENSE COPY ----
+  fml <- as.formula(paste("~", paste(sprintf("`%s`", feats), collapse = " + "), "- 1"))
+  X <- Matrix::sparse.model.matrix(fml, data = baked)
+
   rm(baked); gc(verbose = FALSE)
 
   p_raw <- xgboost::predict(fit$bst, newdata = X, nthread = 1)
+
   rm(X); gc(verbose = FALSE)
 
   if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw
@@ -479,10 +483,16 @@ function(req, res) {
   limit_threads()
   .log("S2 warmup: loading v3...")
   v3 <- get_fit("v3", V3_PATH); invisible(v3$bst); rm(v3); gc()
+  Sys.sleep(0.3)
+
   .log("S2 warmup: loading v4...")
   v4 <- get_fit("v4", V4_PATH); invisible(v4$bst); rm(v4); gc()
+  Sys.sleep(0.3)
+
   .log("S2 warmup: loading v5...")
   v5 <- get_fit("v5", V5_PATH); invisible(v5$bst); rm(v5); gc()
+  Sys.sleep(0.3)
+
   .log("S2 warmup: done.")
   list(ok = TRUE, warmed = c("v3","v4","v5"))
 }
@@ -659,10 +669,10 @@ function(req, res) {
   thr3   <- get_thr(v3_fit, v3_meta, 0.50)
   .log("s2_infer: predicting v3")
   p3 <- try(predict_s2_probs(v3_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p3, "try-error")) { 
+  if (inherits(p3, "try-error")) {
     res$status <- 400
-    .log("s2_infer: v3 prediction failed")
-    return(list(error = "v3 prediction failed", message = as.character(p3))) 
+    .log("s2_infer: v3 prediction failed -> ", substr(as.character(p3), 1, 200))
+  return(list(error = "v3 prediction failed", message = as.character(p3)))
   }
   .log("s2_infer: v3 done")
   rm(v3_fit); gc(verbose = FALSE)
@@ -673,10 +683,10 @@ function(req, res) {
   thr4   <- get_thr(v4_fit, v4_meta, 0.50)
   .log("s2_infer: predicting v4")
   p4 <- try(predict_s2_probs(v4_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p4, "try-error")) { 
+  if (inherits(p4, "try-error")) {
     res$status <- 400
-    .log("s2_infer: v4 prediction failed")
-    return(list(error = "v4 prediction failed", message = as.character(p4))) 
+    .log("s2_infer: v4 prediction failed -> ", substr(as.character(p4), 1, 200))
+    return(list(error = "v4 prediction failed", message = as.character(p4)))
   }
   .log("s2_infer: v4 done")
   rm(v4_fit); gc(verbose = FALSE)
@@ -687,10 +697,10 @@ function(req, res) {
   thr5   <- get_thr(v5_fit, v5_meta, 0.50)
   .log("s2_infer: predicting v5")
   p5 <- try(predict_s2_probs(v5_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p5, "try-error")) { 
-    res$status <- 400
-    .log("s2_infer: v5 prediction failed")
-    return(list(error = "v5 prediction failed", message = as.character(p5))) 
+  if (inherits(p5, "try-error")) {
+  res$status <- 400
+  .log("s2_infer: v5 prediction failed -> ", substr(as.character(p5), 1, 200))
+  return(list(error = "v5 prediction failed", message = as.character(p5)))
   }
   .log("s2_infer: v5 done")
   rm(v5_fit); gc(verbose = FALSE)

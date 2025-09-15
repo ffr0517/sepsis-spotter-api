@@ -230,35 +230,79 @@ cast_to_ptypes <- function(df, ptypes) {
       if (!is.character(x)) df[[nm]] <- as.character(x)
     }
   }
-  df[, names(ptypes), drop = FALSE]
+  df
 }
 
 predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   stopifnot(!is.null(fit$prep), !is.null(fit$bst))
+
+  # 1) Cast known predictor ptypes but DO NOT drop other cols
   if (!is.null(fit$predictor_ptypes)) {
     new_data <- cast_to_ptypes(new_data, fit$predictor_ptypes)
+  } else {
+    new_data <- as.data.frame(new_data, stringsAsFactors = FALSE)
   }
 
+  # 2) Ensure ALL variables referenced by the recipe exist
+  #    (recipes needs them even if later removed)
+  needed <- unique(recipes::summary(fit$prep)$variable)
+
+  # Build a prototype pool from what we saved in the bundle
+  proto_pool <- list()
+  if (!is.null(fit$predictor_ptypes))    proto_pool <- c(proto_pool, fit$predictor_ptypes)
+  if (!is.null(fit$id_role_ptypes))      proto_pool <- c(proto_pool, fit$id_role_ptypes)
+  if (!is.null(fit$outcome_ptypes))      proto_pool <- c(proto_pool, fit$outcome_ptypes)
+
+  miss <- setdiff(needed, names(new_data))
+
+if (length(miss)) {
+  # short log of what's being added
+  suffix <- if (length(miss) > 12) " … (more)" else ""
+  .log(
+    "s2_infer: adding missing vars -> ",
+    paste(utils::head(miss, 12), collapse = ", "),
+    suffix
+  )
+
+  n <- nrow(new_data)
+  for (nm in miss) {
+    proto <- proto_pool[[nm]]
+    if (!is.null(proto)) {
+      new_data[[nm]] <- vctrs::vec_init(proto, n)
+    } else {
+      # Fallback heuristics: ids as character, flag/dummy-ish as integer, else numeric
+      if (grepl("^(label|site|ipdopd)$", nm)) {
+        new_data[[nm]] <- rep(NA_character_, n)
+      } else if (grepl("^(na[_]|na_ind_|.*(_X0|_X1|_unknown|_new)$)", nm)) {
+        new_data[[nm]] <- rep(NA_integer_, n)
+      } else {
+        new_data[[nm]] <- rep(NA_real_, n)
+      }
+    }
+  }
+}
+
+  # 3) Now bake safely
   baked <- bake(fit$prep, new_data = new_data)
 
-  # Align to training feature vector
+  # 4) Align to training feature set (add any missing with 0)
   feats <- fit$features
-  miss <- setdiff(feats, names(baked))
-  if (length(miss)) for (mc in miss) baked[[mc]] <- 0
+  miss_feats <- setdiff(feats, names(baked))
+  if (length(miss_feats)) for (mc in miss_feats) baked[[mc]] <- 0
   baked <- baked[, feats, drop = FALSE]
 
-  # ---- BUILD SPARSE WITHOUT DENSE COPY ----
+  # 5) Build sparse design without dense copy
   fml <- as.formula(paste("~", paste(sprintf("`%s`", feats), collapse = " + "), "- 1"))
   X <- Matrix::sparse.model.matrix(fml, data = baked)
-
   rm(baked); gc(verbose = FALSE)
 
+  # 6) Predict with one thread
   p_raw <- xgboost::predict(fit$bst, newdata = X, nthread = 1)
-
   rm(X); gc(verbose = FALSE)
 
   if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw
 }
+
 
 prop_excess <- function(p, thr, eps = 1e-6) pmax(0, (p - thr) / pmax(thr, eps))
 

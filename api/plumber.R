@@ -469,6 +469,32 @@ function(req, res) {
   forward()
 }
 
+# --- simple tracing helper ---
+.now <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+
+.log <- function(...) { cat(sprintf("[%s] ", .now()), ..., "\n"); flush.console() }
+
+#* @post /s2_warmup
+function(req, res) {
+  limit_threads()
+  .log("S2 warmup: loading v3...")
+  v3 <- get_fit("v3", V3_PATH); invisible(v3$bst); rm(v3); gc()
+  .log("S2 warmup: loading v4...")
+  v4 <- get_fit("v4", V4_PATH); invisible(v4$bst); rm(v4); gc()
+  .log("S2 warmup: loading v5...")
+  v5 <- get_fit("v5", V5_PATH); invisible(v5$bst); rm(v5); gc()
+  .log("S2 warmup: done.")
+  list(ok = TRUE, warmed = c("v3","v4","v5"))
+}
+
+#* @get /s2_trace
+function() {
+  list(
+    models_loaded = list(v3 = is_loaded("v3"), v4 = is_loaded("v4"), v5 = is_loaded("v5")),
+    mem = as.list(gc()[, c("used","gc trigger","max used")])
+  )
+}
+
 # ---------------------------------------------------------------------
 # Health / schema
 # ---------------------------------------------------------------------
@@ -619,6 +645,7 @@ return(resp)
 #* @post /s2_infer
 function(req, res) {
   limit_threads()  # ensure per-request too
+  .log("s2_infer: start")
 
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
   feats_in <- as.data.frame(body$features, stringsAsFactors = FALSE)
@@ -627,34 +654,49 @@ function(req, res) {
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
 
   # ---------- v3 ----------
+  .log("s2_infer: loading v3")
   v3_fit <- get_fit("v3", V3_PATH)
   thr3   <- get_thr(v3_fit, v3_meta, 0.50)
-
+  .log("s2_infer: predicting v3")
   p3 <- try(predict_s2_probs(v3_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p3, "try-error")) { res$status <- 400; return(list(error = "v3 prediction failed", message = as.character(p3))) }
-
-  # free as much as possible before v4
+  if (inherits(p3, "try-error")) { 
+    res$status <- 400
+    .log("s2_infer: v3 prediction failed")
+    return(list(error = "v3 prediction failed", message = as.character(p3))) 
+  }
+  .log("s2_infer: v3 done")
   rm(v3_fit); gc(verbose = FALSE)
 
   # ---------- v4 ----------
+  .log("s2_infer: loading v4")
   v4_fit <- get_fit("v4", V4_PATH)
   thr4   <- get_thr(v4_fit, v4_meta, 0.50)
-
+  .log("s2_infer: predicting v4")
   p4 <- try(predict_s2_probs(v4_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p4, "try-error")) { res$status <- 400; return(list(error = "v4 prediction failed", message = as.character(p4))) }
-
+  if (inherits(p4, "try-error")) { 
+    res$status <- 400
+    .log("s2_infer: v4 prediction failed")
+    return(list(error = "v4 prediction failed", message = as.character(p4))) 
+  }
+  .log("s2_infer: v4 done")
   rm(v4_fit); gc(verbose = FALSE)
 
   # ---------- v5 ----------
+  .log("s2_infer: loading v5")
   v5_fit <- get_fit("v5", V5_PATH)
   thr5   <- get_thr(v5_fit, v5_meta, 0.50)
-
+  .log("s2_infer: predicting v5")
   p5 <- try(predict_s2_probs(v5_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p5, "try-error")) { res$status <- 400; return(list(error = "v5 prediction failed", message = as.character(p5))) }
-
+  if (inherits(p5, "try-error")) { 
+    res$status <- 400
+    .log("s2_infer: v5 prediction failed")
+    return(list(error = "v5 prediction failed", message = as.character(p5))) 
+  }
+  .log("s2_infer: v5 done")
   rm(v5_fit); gc(verbose = FALSE)
 
   # ---------- routing ----------
+  .log("s2_infer: routing results")
   call <- route_s2(p3, p4, p5, thr3, thr4, thr5)
   f3 <- as.integer(p3 >= thr3); f4 <- as.integer(p4 >= thr4); f5 <- as.integer(p5 >= thr5)
   bit_key <- paste0(f3, f4, f5)
@@ -668,6 +710,8 @@ function(req, res) {
     call = as.character(call)
   )
 
+  .log("s2_infer: finished")
   jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
 }
+
 

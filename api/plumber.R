@@ -6,6 +6,19 @@ library(workflows)
 library(rlang)
 library(vctrs)
 
+limit_threads <- function() {
+  # BLAS/OpenMP families
+  Sys.setenv(
+    OMP_NUM_THREADS = "1",
+    OPENBLAS_NUM_THREADS = "1",
+    MKL_NUM_THREADS = "1",
+    VECLIB_MAXIMUM_THREADS = "1",
+    NUMEXPR_NUM_THREADS = "1",
+    XGBOOST_NUM_THREADS = "1"
+  )
+}
+limit_threads()
+
 # ---------------------------------------------------------------------
 # Lazy model loader
 # ---------------------------------------------------------------------
@@ -234,8 +247,11 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   if (length(miss)) for (mc in miss) baked[[mc]] <- 0
   baked <- baked[, feats, drop = FALSE]
 
-  X <- Matrix::Matrix(as.matrix(baked), sparse = TRUE)
-  p_raw <- xgboost::predict(fit$bst, newdata = X)
+  X <- Matrix::as(as.matrix(baked), "dgCMatrix")
+  rm(baked); gc(verbose = FALSE)
+
+  p_raw <- xgboost::predict(fit$bst, newdata = X, nthread = 1)
+  rm(X); gc(verbose = FALSE)
 
   if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw
 }
@@ -602,50 +618,51 @@ return(resp)
 # ---------------------------------------------------------------------
 #* @post /s2_infer
 function(req, res) {
-  # Lazy-load S2 models
-  v3_fit <- get_fit("v3", V3_PATH)
-  v4_fit <- get_fit("v4", V4_PATH)
-  v5_fit <- get_fit("v5", V5_PATH)
-
-  # Compute effective thresholds (meta preferred; fallback to fit op point)
-  eff_thr_v3 <- get_thr(v3_fit, v3_meta, 0.50)
-  eff_thr_v4 <- get_thr(v4_fit, v4_meta, 0.50)
-  eff_thr_v5 <- get_thr(v5_fit, v5_meta, 0.50)
+  limit_threads()  # ensure per-request too
 
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
   feats_in <- as.data.frame(body$features, stringsAsFactors = FALSE)
-
   if (!nrow(feats_in)) feats_in <- feats_in[NA, , drop = FALSE]
-  # If caller supplies label/id, keep it; otherwise create a simple row id
   if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
-
-  # Decide whether to apply calibration (default TRUE)
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
 
-  # Predict (each S2 bundle bakes internally; schema via saved ptypes)
+  # ---------- v3 ----------
+  v3_fit <- get_fit("v3", V3_PATH)
+  thr3   <- get_thr(v3_fit, v3_meta, 0.50)
+
   p3 <- try(predict_s2_probs(v3_fit, feats_in, calibrated = use_cal), silent = TRUE)
   if (inherits(p3, "try-error")) { res$status <- 400; return(list(error = "v3 prediction failed", message = as.character(p3))) }
+
+  # free as much as possible before v4
+  rm(v3_fit); gc(verbose = FALSE)
+
+  # ---------- v4 ----------
+  v4_fit <- get_fit("v4", V4_PATH)
+  thr4   <- get_thr(v4_fit, v4_meta, 0.50)
 
   p4 <- try(predict_s2_probs(v4_fit, feats_in, calibrated = use_cal), silent = TRUE)
   if (inherits(p4, "try-error")) { res$status <- 400; return(list(error = "v4 prediction failed", message = as.character(p4))) }
 
+  rm(v4_fit); gc(verbose = FALSE)
+
+  # ---------- v5 ----------
+  v5_fit <- get_fit("v5", V5_PATH)
+  thr5   <- get_thr(v5_fit, v5_meta, 0.50)
+
   p5 <- try(predict_s2_probs(v5_fit, feats_in, calibrated = use_cal), silent = TRUE)
   if (inherits(p5, "try-error")) { res$status <- 400; return(list(error = "v5 prediction failed", message = as.character(p5))) }
 
-  # Routing
-  call <- route_s2(p3, p4, p5, eff_thr_v3, eff_thr_v4, eff_thr_v5)
+  rm(v5_fit); gc(verbose = FALSE)
 
-  # Flags + bit key for auditability
-  f3 <- as.integer(p3 >= eff_thr_v3)
-  f4 <- as.integer(p4 >= eff_thr_v4)
-  f5 <- as.integer(p5 >= eff_thr_v5)
+  # ---------- routing ----------
+  call <- route_s2(p3, p4, p5, thr3, thr4, thr5)
+  f3 <- as.integer(p3 >= thr3); f4 <- as.integer(p4 >= thr4); f5 <- as.integer(p5 >= thr5)
   bit_key <- paste0(f3, f4, f5)
 
-  # Response rows
   resp <- tibble::tibble(
     label = feats_in$label,
     p_v3 = p3, p_v4 = p4, p_v5 = p5,
-    thr_v3 = eff_thr_v3, thr_v4 = eff_thr_v4, thr_v5 = eff_thr_v5,
+    thr_v3 = thr3, thr_v4 = thr4, thr_v5 = thr5,
     f_v3 = f3, f_v4 = f4, f_v5 = f5,
     bit_key = bit_key,
     call = as.character(call)
@@ -653,3 +670,4 @@ function(req, res) {
 
   jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
 }
+

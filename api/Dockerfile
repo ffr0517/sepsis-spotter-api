@@ -30,6 +30,12 @@ COPY models /app/models
 
 EXPOSE 8000
 
-ENV OMP_NUM_THREADS=1
+ENV OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    VECLIB_MAXIMUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    XGBOOST_NUM_THREADS=1
+
 CMD ["R", "-e", "pr <- plumber::plumb('plumber.R'); pr$run(host='0.0.0.0', port=8000)"]
 

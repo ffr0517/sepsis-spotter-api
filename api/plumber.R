@@ -7,21 +7,30 @@ library(rlang)
 library(vctrs)
 
 # ---------------------------------------------------------------------
-# Load S1 models + metas
+# Lazy model loader
 # ---------------------------------------------------------------------
-v1_obj  <- readRDS("models/v1_model.rds")
-v1_meta <- readRDS("models/v1_meta.rds")
-v2_obj  <- readRDS("models/v2_model.rds")
-v2_meta <- readRDS("models/v2_meta.rds")
+.load_env <- new.env(parent = emptyenv())
 
-# ---------------------------------------------------------------------
-# Load S2 (v3/v4/v5) models + metas
-# ---------------------------------------------------------------------
-v3_fit  <- readRDS("models/v3_model.rds")  
+get_fit <- function(key, path) {
+  if (!exists(key, envir = .load_env, inherits = FALSE)) {
+    assign(key, readRDS(path), envir = .load_env)
+  }
+  get(key, envir = .load_env, inherits = FALSE)
+}
+
+is_loaded <- function(key) exists(key, envir = .load_env, inherits = FALSE)
+
+# Model paths
+V1_PATH <- "models/v1_model.rds"
+V2_PATH <- "models/v2_model.rds"
+V3_PATH <- "models/v3_model.rds"
+V4_PATH <- "models/v4_model.rds"
+V5_PATH <- "models/v5_model.rds"
+
+v1_meta <- readRDS("models/v1_meta.rds")
+v2_meta <- readRDS("models/v2_meta.rds")
 v3_meta <- readRDS("models/v3_meta.rds")
-v4_fit  <- readRDS("models/v4_model.rds")
 v4_meta <- readRDS("models/v4_meta.rds")
-v5_fit  <- readRDS("models/v5_model.rds")
 v5_meta <- readRDS("models/v5_meta.rds")
 
 # ---------------------------------------------------------------------
@@ -121,10 +130,6 @@ eff_margin        <- get_num(v1_meta$margin,           DEF_MARGIN)
 eff_veto_soft     <- get_num(v2_meta$veto_soft,        DEF_VETO_SOFT)
 eff_v1_strong     <- get_num(v1_meta$v1_strong,        DEF_V1_STRONG)
 eff_low_v2_rescue <- get_num(v2_meta$low_v2_rescue,    DEF_LOW_V2_RESCUE)
-
-eff_thr_v3 <- get_thr(v3_fit, v3_meta, 0.50)
-eff_thr_v4 <- get_thr(v4_fit, v4_meta, 0.50)
-eff_thr_v5 <- get_thr(v5_fit, v5_meta, 0.50)
 
 # ---------------------------------------------------------------------
 # Workflow helpers
@@ -462,42 +467,35 @@ function() list(
     veto_soft     = eff_veto_soft,
     v1_strong     = eff_v1_strong,
     low_v2_rescue = eff_low_v2_rescue,
-    thr_v3        = eff_thr_v3,
-    thr_v4        = eff_thr_v4,
-    thr_v5        = eff_thr_v5
+    # S2 thresholds from meta only (won't load models):
+    thr_v3        = if (!is.null(v3_meta$threshold)) as.numeric(v3_meta$threshold) else NA_real_,
+    thr_v4        = if (!is.null(v4_meta$threshold)) as.numeric(v4_meta$threshold) else NA_real_,
+    thr_v5        = if (!is.null(v5_meta$threshold)) as.numeric(v5_meta$threshold) else NA_real_
   ),
-  s2_models = list(
-    v3 = !is.null(v3_fit$bst),
-    v4 = !is.null(v4_fit$bst),
-    v5 = !is.null(v5_fit$bst)
+  s2_models_loaded = list(
+    v3 = is_loaded("v3"),
+    v4 = is_loaded("v4"),
+    v5 = is_loaded("v5")
   )
 )
 
 #* @get /schema
 function() {
-  fmt <- function(obj) {
-    ptp <- get_required_ptypes(obj)
-    out <- try(get_required_outcomes(obj), silent = TRUE)
-    list(
-      predictors = data.frame(name = names(ptp), type = vapply(ptp, function(x) paste(class(x), collapse="/"), "")),
-      outcomes   = if (inherits(out, "try-error") || is.null(out)) NULL else
-        data.frame(name = names(out), type = vapply(out, function(x) paste(class(x), collapse="/"), ""))
-    )
-  }
-  s2_fmt <- function(fit) {
-    if (is.null(fit$predictor_ptypes)) return(NULL)
-    data.frame(name = names(fit$predictor_ptypes),
-               type = vapply(fit$predictor_ptypes, function(x) paste(class(x), collapse="/"), ""))
-  }
-  list(
-    v1 = fmt(v1_obj),
-    v2 = fmt(v2_obj),
-    S2 = list(
-      v3_predictors = s2_fmt(v3_fit),
-      v4_predictors = s2_fmt(v4_fit),
-      v5_predictors = s2_fmt(v5_fit)
-    )
+  # S1: lightweight summary from metas only
+  s1 <- list(
+    v1 = list(threshold = eff_thr_v1),
+    v2 = list(threshold = eff_thr_v2)
   )
+  # S2: list the feature names from meta if present (or NULL)
+  s2 <- list(
+    v3_threshold = if (!is.null(v3_meta$threshold)) as.numeric(v3_meta$threshold) else NA_real_,
+    v4_threshold = if (!is.null(v4_meta$threshold)) as.numeric(v4_meta$threshold) else NA_real_,
+    v5_threshold = if (!is.null(v5_meta$threshold)) as.numeric(v5_meta$threshold) else NA_real_,
+    v3_features = v3_meta$features %||% NULL,
+    v4_features = v4_meta$features %||% NULL,
+    v5_features = v5_meta$features %||% NULL
+  )
+  list(S1 = s1, S2 = s2)
 }
 
 # ---------------------------------------------------------------------
@@ -505,6 +503,9 @@ function() {
 # ---------------------------------------------------------------------
 #* @post /s1_infer
 function(req, res) {
+  # Lazy-load S1 models
+  v1_obj <- get_fit("v1", V1_PATH)
+  v2_obj <- get_fit("v2", V2_PATH)
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
   feats_in <- as.data.frame(body$features, stringsAsFactors = FALSE)
 
@@ -601,6 +602,16 @@ return(resp)
 # ---------------------------------------------------------------------
 #* @post /s2_infer
 function(req, res) {
+  # Lazy-load S2 models
+  v3_fit <- get_fit("v3", V3_PATH)
+  v4_fit <- get_fit("v4", V4_PATH)
+  v5_fit <- get_fit("v5", V5_PATH)
+
+  # Compute effective thresholds (meta preferred; fallback to fit op point)
+  eff_thr_v3 <- get_thr(v3_fit, v3_meta, 0.50)
+  eff_thr_v4 <- get_thr(v4_fit, v4_meta, 0.50)
+  eff_thr_v5 <- get_thr(v5_fit, v5_meta, 0.50)
+
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
   feats_in <- as.data.frame(body$features, stringsAsFactors = FALSE)
 

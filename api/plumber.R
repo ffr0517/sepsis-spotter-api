@@ -7,12 +7,22 @@ library(rlang)
 library(vctrs)
 
 # ---------------------------------------------------------------------
-# Load models + metas
+# Load S1 models + metas
 # ---------------------------------------------------------------------
 v1_obj  <- readRDS("models/v1_model.rds")
 v1_meta <- readRDS("models/v1_meta.rds")
 v2_obj  <- readRDS("models/v2_model.rds")
 v2_meta <- readRDS("models/v2_meta.rds")
+
+# ---------------------------------------------------------------------
+# Load S2 (v3/v4/v5) models + metas
+# ---------------------------------------------------------------------
+v3_fit  <- readRDS("models/v3_model.rds")  
+v3_meta <- readRDS("models/v3_meta.rds")
+v4_fit  <- readRDS("models/v4_model.rds")
+v4_meta <- readRDS("models/v4_meta.rds")
+v5_fit  <- readRDS("models/v5_model.rds")
+v5_meta <- readRDS("models/v5_meta.rds")
 
 # ---------------------------------------------------------------------
 # Defaults / knobs (used if meta doesn't define them)
@@ -99,7 +109,12 @@ add_role_stubs <- function(obj, df) {
   df
 }
 
-# Pull effective knobs from metas (fallback to defaults)
+get_thr <- function(fit, meta, default = 0.5) {
+  if (!is.null(meta$threshold)) return(as.numeric(meta$threshold))
+  if (!is.null(fit$operating_point$threshold)) return(as.numeric(fit$operating_point$threshold))
+  default
+}
+
 eff_thr_v1        <- get_num(v1_meta$threshold,        DEF_THR_V1)
 eff_thr_v2        <- get_num(v2_meta$threshold,        DEF_THR_V2)
 eff_margin        <- get_num(v1_meta$margin,           DEF_MARGIN)
@@ -107,9 +122,19 @@ eff_veto_soft     <- get_num(v2_meta$veto_soft,        DEF_VETO_SOFT)
 eff_v1_strong     <- get_num(v1_meta$v1_strong,        DEF_V1_STRONG)
 eff_low_v2_rescue <- get_num(v2_meta$low_v2_rescue,    DEF_LOW_V2_RESCUE)
 
+eff_thr_v3 <- get_thr(v3_fit, v3_meta, 0.50)
+eff_thr_v4 <- get_thr(v4_fit, v4_meta, 0.50)
+eff_thr_v5 <- get_thr(v5_fit, v5_meta, 0.50)
+
 # ---------------------------------------------------------------------
 # Workflow helpers
 # ---------------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(recipes)
+  library(Matrix)
+  library(xgboost)
+})
+
 is_trained_wf <- function(x) {
   inherits(x, "workflow") && tryCatch(workflows::is_trained_workflow(x), error = function(e) FALSE)
 }
@@ -133,6 +158,128 @@ predict_probs_safe <- function(obj, new_data) {
     }
   )
 }
+
+apply_calibrator <- function(p_raw, calib, eps = 1e-6) {
+  if (is.null(calib) || is.null(calib$ok) || !isTRUE(calib$ok)) return(p_raw)
+  p_safe <- pmin(1 - eps, pmax(eps, p_raw))
+  b0 <- calib$coef[["(Intercept)"]]
+  b1 <- calib$coef[["qlogis(p)"]]
+  plogis(b0 + b1 * qlogis(p_safe))
+}
+
+cast_to_ptypes <- function(df, ptypes) {
+  df <- as.data.frame(df, stringsAsFactors = FALSE)
+  n <- nrow(df)
+  # Add missing predictors
+  miss <- setdiff(names(ptypes), names(df))
+  if (length(miss)) for (nm in miss) df[[nm]] <- vctrs::vec_init(ptypes[[nm]], n)
+
+  # Cast existing to prototype classes
+  to_bin_char <- function(x) {
+    if (is.factor(x)) x <- as.character(x)
+    if (is.logical(x)) return(ifelse(isTRUE(x), "1", "0"))
+    x <- trimws(tolower(as.character(x)))
+    ifelse(x %in% c("1","true","t","yes","y","m","male"), "1",
+      ifelse(x %in% c("0","false","f","no","n","female","fem"), "0", x))
+  }
+
+  for (nm in names(ptypes)) {
+    proto <- ptypes[[nm]]
+    x <- df[[nm]]
+    if (is.factor(proto)) {
+      lv <- levels(proto)
+      if (is.numeric(x) || is.integer(x) || is.logical(x)) x <- to_bin_char(x)
+      x <- trimws(as.character(x))
+      if (length(lv) == 2L) {
+        low <- lv[1]; high <- lv[2]
+        if (all(c("0","1") %in% lv)) {
+          x <- ifelse(x %in% c("0","1"), x, NA_character_)
+        } else {
+          x <- ifelse(x == "0", low, ifelse(x == "1", high, x))
+        }
+      }
+      df[[nm]] <- factor(ifelse(x %in% lv, x, NA_character_), levels = lv)
+    } else if (is.numeric(proto)) {
+      if (!is.numeric(x)) df[[nm]] <- suppressWarnings(as.numeric(x))
+    } else if (is.integer(proto)) {
+      if (!is.integer(x)) df[[nm]] <- suppressWarnings(as.integer(x))
+    } else if (is.logical(proto)) {
+      if (!is.logical(x)) {
+        xl <- tolower(as.character(x))
+        df[[nm]] <- xl %in% c("1","true","t","yes","y")
+      }
+    } else if (is.character(proto)) {
+      if (!is.character(x)) df[[nm]] <- as.character(x)
+    }
+  }
+  df[, names(ptypes), drop = FALSE]
+}
+
+predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
+  stopifnot(!is.null(fit$prep), !is.null(fit$bst))
+  # If predictor_ptypes exist, cast before baking (helps recipes step_unknown/novel)
+  if (!is.null(fit$predictor_ptypes)) {
+    new_data <- cast_to_ptypes(new_data, fit$predictor_ptypes)
+  }
+  baked <- bake(fit$prep, new_data = new_data)
+
+  # Align columns to training features
+  feats <- fit$features
+  miss <- setdiff(feats, names(baked))
+  if (length(miss)) for (mc in miss) baked[[mc]] <- 0
+  baked <- baked[, feats, drop = FALSE]
+
+  X <- Matrix::Matrix(as.matrix(baked), sparse = TRUE)
+  p_raw <- xgboost::predict(fit$bst, newdata = X)
+
+  if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw
+}
+
+prop_excess <- function(p, thr, eps = 1e-6) pmax(0, (p - thr) / pmax(thr, eps))
+
+route_s2 <- function(p3, p4, p5, thr3, thr4, thr5) {
+  f3 <- as.integer(p3 >= thr3)
+  f4 <- as.integer(p4 >= thr4)
+  f5 <- as.integer(p5 >= thr5)
+
+  m3 <- prop_excess(p3, thr3)
+  m4 <- prop_excess(p4, thr4)
+  m5 <- prop_excess(p5, thr5)
+
+  key <- paste0(f3, f4, f5)
+  out <- character(length(key))
+
+  # Direct mappings
+  out[key == "000"] <- "NonSevere"
+  out[key == "100"] <- "Severe"
+  out[key == "010"] <- "ProbSevere"
+  out[key == "001"] <- "ProbNonSevere"
+
+  # Tie patterns with proportional margins
+  idx <- which(key %in% c("110","111"))  # Severe vs ProbSevere
+  if (length(idx)) {
+    choose <- ifelse(m3[idx] > m4[idx], "Severe",
+              ifelse(m4[idx] > m3[idx], "ProbSevere", "ProbSevere")) # tie -> conservative
+    out[idx] <- choose
+  }
+
+  idx <- which(key == "101")             # Severe vs ProbNonSevere
+  if (length(idx)) {
+    choose <- ifelse(m3[idx] > m5[idx], "Severe",
+              ifelse(m5[idx] > m3[idx], "ProbNonSevere", "ProbNonSevere"))
+    out[idx] <- choose
+  }
+
+  idx <- which(key == "011")             # ProbSevere vs ProbNonSevere
+  if (length(idx)) {
+    choose <- ifelse(m4[idx] > m5[idx], "ProbSevere",
+              ifelse(m5[idx] > m4[idx], "ProbNonSevere", "ProbNonSevere"))
+    out[idx] <- choose
+  }
+
+  factor(out, levels = c("NonSevere","ProbNonSevere","ProbSevere","Severe"))
+}
+
 
 # ---------------------------------------------------------------------
 # Schema guard: align request to each workflow's expected predictor ptypes
@@ -307,14 +454,22 @@ function(req, res) {
 #* @get /healthz
 function() list(
   ok = TRUE,
-  service = "S1",
+  service = "S1+S2",
   defaults = list(
     thr_v1        = eff_thr_v1,
     thr_v2        = eff_thr_v2,
     margin        = eff_margin,
     veto_soft     = eff_veto_soft,
     v1_strong     = eff_v1_strong,
-    low_v2_rescue = eff_low_v2_rescue
+    low_v2_rescue = eff_low_v2_rescue,
+    thr_v3        = eff_thr_v3,
+    thr_v4        = eff_thr_v4,
+    thr_v5        = eff_thr_v5
+  ),
+  s2_models = list(
+    v3 = !is.null(v3_fit$bst),
+    v4 = !is.null(v4_fit$bst),
+    v5 = !is.null(v5_fit$bst)
   )
 )
 
@@ -329,7 +484,20 @@ function() {
         data.frame(name = names(out), type = vapply(out, function(x) paste(class(x), collapse="/"), ""))
     )
   }
-  list(v1 = fmt(v1_obj), v2 = fmt(v2_obj))
+  s2_fmt <- function(fit) {
+    if (is.null(fit$predictor_ptypes)) return(NULL)
+    data.frame(name = names(fit$predictor_ptypes),
+               type = vapply(fit$predictor_ptypes, function(x) paste(class(x), collapse="/"), ""))
+  }
+  list(
+    v1 = fmt(v1_obj),
+    v2 = fmt(v2_obj),
+    S2 = list(
+      v3_predictors = s2_fmt(v3_fit),
+      v4_predictors = s2_fmt(v4_fit),
+      v5_predictors = s2_fmt(v5_fit)
+    )
+  )
 }
 
 # ---------------------------------------------------------------------
@@ -428,4 +596,49 @@ function(req, res) {
 return(resp)  
 }
 
+# ---------------------------------------------------------------------
+# S2 inference (v3/v4/v5 -> 4-class with margin-normalised tie-breaks)
+# ---------------------------------------------------------------------
+#* @post /s2_infer
+function(req, res) {
+  body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
+  feats_in <- as.data.frame(body$features, stringsAsFactors = FALSE)
 
+  if (!nrow(feats_in)) feats_in <- feats_in[NA, , drop = FALSE]
+  # If caller supplies label/id, keep it; otherwise create a simple row id
+  if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
+
+  # Decide whether to apply calibration (default TRUE)
+  use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
+
+  # Predict (each S2 bundle bakes internally; schema via saved ptypes)
+  p3 <- try(predict_s2_probs(v3_fit, feats_in, calibrated = use_cal), silent = TRUE)
+  if (inherits(p3, "try-error")) { res$status <- 400; return(list(error = "v3 prediction failed", message = as.character(p3))) }
+
+  p4 <- try(predict_s2_probs(v4_fit, feats_in, calibrated = use_cal), silent = TRUE)
+  if (inherits(p4, "try-error")) { res$status <- 400; return(list(error = "v4 prediction failed", message = as.character(p4))) }
+
+  p5 <- try(predict_s2_probs(v5_fit, feats_in, calibrated = use_cal), silent = TRUE)
+  if (inherits(p5, "try-error")) { res$status <- 400; return(list(error = "v5 prediction failed", message = as.character(p5))) }
+
+  # Routing
+  call <- route_s2(p3, p4, p5, eff_thr_v3, eff_thr_v4, eff_thr_v5)
+
+  # Flags + bit key for auditability
+  f3 <- as.integer(p3 >= eff_thr_v3)
+  f4 <- as.integer(p4 >= eff_thr_v4)
+  f5 <- as.integer(p5 >= eff_thr_v5)
+  bit_key <- paste0(f3, f4, f5)
+
+  # Response rows
+  resp <- tibble::tibble(
+    label = feats_in$label,
+    p_v3 = p3, p_v4 = p4, p_v5 = p5,
+    thr_v3 = eff_thr_v3, thr_v4 = eff_thr_v4, thr_v5 = eff_thr_v5,
+    f_v3 = f3, f_v4 = f4, f_v5 = f5,
+    bit_key = bit_key,
+    call = as.character(call)
+  )
+
+  jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
+}

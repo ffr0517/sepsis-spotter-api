@@ -245,7 +245,7 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
 
   # 2) Ensure ALL variables referenced by the recipe exist
   #    (recipes needs them even if later removed)
-  needed <- unique(recipes::summary(fit$prep)$variable)
+  needed <- unique(summary(fit$prep)$variable)
 
   # Build a prototype pool from what we saved in the bundle
   proto_pool <- list()

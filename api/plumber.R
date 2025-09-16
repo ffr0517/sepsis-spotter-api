@@ -756,9 +756,7 @@ function(req, res) {
   if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
   on.exit({
-  if (!CACHE_MODELS) {
-    release_fit("v3"); release_fit("v4"); release_fit("v5")
-  }
+  if (!CACHE_MODELS) { release_fit("v3"); release_fit("v4"); release_fit("v5") }
   invisible(gc())
 }, add = TRUE)
 

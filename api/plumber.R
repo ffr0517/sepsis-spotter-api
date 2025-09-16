@@ -39,7 +39,10 @@ S2_REQUIRED_STUB_COLS <- c(
   "label","w_final",".case_w",
   "SFI_bin_severe_vs_other","SFI_bin_probSev_vs_other","SFI_bin_probNS_vs_other",
   "site","ipdopd","outcome.binary","infection","weight","weight_bin",
-  "strata_var","n_stratum","p_stratum","SFI_5cat"
+  "strata_var","n_stratum","p_stratum","SFI_5cat",
+  # NEW (from error log)
+  "urti","lrti","neuro","auf","LqSOFA","syndrome.resp","syndrome.nonresp",
+  "prop_handoff","ipw"
 )
 
 # ---------------------------------------------------------------------
@@ -293,11 +296,25 @@ if (length(miss)) {
     if (!is.null(proto)) {
       new_data[[nm]] <- vctrs::vec_init(proto, n)
     } else {
-      # Fallback heuristics: ids as character, flag/dummy-ish as integer, else numeric
+      # Fallback heuristics: ids/labels as character; obvious binary flags as integer; else numeric
       if (grepl("^(label|site|ipdopd)$", nm)) {
         new_data[[nm]] <- rep(NA_character_, n)
+
+      } else if (grepl("^(urti|lrti|neuro|auf|prop_handoff)$", nm)) {
+        # these were 0/1-ish flags in training
+        new_data[[nm]] <- rep(NA_integer_, n)
+
+      } else if (grepl("^syndrome\\.(resp|nonresp)$", nm)) {
+        # also dummy/flag-like
+        new_data[[nm]] <- rep(NA_integer_, n)
+
+      } else if (grepl("^(ipw|LqSOFA)$", nm)) {
+        # numeric scores/weights
+        new_data[[nm]] <- rep(NA_real_, n)
+
       } else if (grepl("^(na[_]|na_ind_|.*(_X0|_X1|_unknown|_new)$)", nm)) {
         new_data[[nm]] <- rep(NA_integer_, n)
+
       } else {
         new_data[[nm]] <- rep(NA_real_, n)
       }
@@ -720,6 +737,7 @@ return(resp)
 # S2 inference (v3/v4/v5 -> 4-class with margin-normalised tie-breaks)
 # ---------------------------------------------------------------------
 #* @post /s2_infer
+#* @post /s2_infer
 function(req, res) {
   limit_threads()
   .log("s2_infer: start")
@@ -733,10 +751,10 @@ function(req, res) {
   # ---------- schema padding (critical) ----------
   n <- nrow(feats_in)
 
-  # 2a) Ensure training-remembered columns exist (so bake() won't error)
+  # Ensure training-remembered basics
   add_if_missing <- function(df, nm, val) { if (!nm %in% names(df)) df[[nm]] <- val; df }
-  feats_in <- add_if_missing(feats_in, "w_final",  rep(1, n))
-  feats_in <- add_if_missing(feats_in, ".case_w",  rep(1, n))
+  feats_in <- add_if_missing(feats_in, "w_final", rep(1, n))
+  feats_in <- add_if_missing(feats_in, ".case_w", rep(1, n))
 
   # Outcomes remembered by the recipe; give factor levels to be safe
   lvl_sev  <- c("Other","Severe")
@@ -749,10 +767,13 @@ function(req, res) {
   if (!"SFI_bin_probNS_vs_other" %in% names(feats_in))
     feats_in$SFI_bin_probNS_vs_other  <- factor(rep("Other", n), levels = lvl_pns)
 
-  # Nuisance training columns the recipe saw — types are unimportant since step_rm() will drop them
-  for (nm in c("site","ipdopd","outcome.binary","infection","weight","weight_bin",
-               "strata_var","n_stratum","p_stratum","SFI_5cat")) {
-    if (!nm %in% names(feats_in)) feats_in[[nm]] <- NA
+  # >>> PLACE THE NEW STUB LOOP HERE <<<
+  # Stub any remembered training columns the recipe references
+  for (nm in S2_REQUIRED_STUB_COLS) {
+    if (!nm %in% names(feats_in)) {
+      # type doesn't matter; step_rm() will drop them
+      feats_in[[nm]] <- NA_real_
+    }
   }
 
   # 2b) Pad ALL model predictors so downstream casting doesn’t fail
@@ -816,6 +837,7 @@ function(req, res) {
   .log("s2_infer: finished")
   jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
 }
+
 
 
 

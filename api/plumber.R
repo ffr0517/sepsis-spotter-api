@@ -316,7 +316,20 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
     }
   }
 
-  ## >>> INSERTED: smart-impute + factor-ize binary flags BEFORE bake() <<<
+  # ---- Smart binary coercion (single pass, warning-free) ----
+  coerce_bin_safely <- function(x) {
+    if (is.character(x)) {
+      x <- trimws(x); x[x == ""] <- NA
+      xi <- suppressWarnings(as.integer(x))
+    } else if (is.logical(x)) {
+      xi <- as.integer(x)
+    } else {
+      xi <- suppressWarnings(as.integer(x))
+    }
+    xi[is.na(xi)] <- 0L
+    pmin.int(pmax.int(xi, 0L), 1L)
+  }
+
   bin_cat <- c(
     "bgcombyn","adm.recent","waste","stunt","prior.care","travel.time.bin",
     "diarrhoeal","ensapro","vomit.all","seiz","pfacleth","crt.long",
@@ -325,15 +338,12 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   )
 
   for (nm in intersect(bin_cat, names(new_data))) {
-    x <- new_data[[nm]]
-    # treat NA/"" as 0; coerce to integer then factor(0,1)
-    xi <- as.integer(ifelse(is.na(x) | x == "", 0L, as.integer(x)))
-    xi[!xi %in% c(0L, 1L)] <- 0L
+    xi <- coerce_bin_safely(new_data[[nm]])
     new_data[[nm]] <- factor(xi, levels = c(0L, 1L))
   }
-  ## <<< END INSERTION <<<
+  # -----------------------------------------------------------
 
-  # 3) Now bake safely
+  # 3) Bake
   baked <- bake(fit$prep, new_data = new_data)
 
   # 4) Align to training feature set (add any missing with 0)
@@ -342,17 +352,24 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   if (length(miss_feats)) for (mc in miss_feats) baked[[mc]] <- 0
   baked <- baked[, feats, drop = FALSE]
 
-  # 5) Build sparse design without dense copy
+  # 5) Sparse design (no dense copy)
   fml <- as.formula(paste("~", paste(sprintf("`%s`", feats), collapse = " + "), "- 1"))
   X <- Matrix::sparse.model.matrix(fml, data = baked)
-  rm(baked); gc(verbose = FALSE)
+  rm(baked); gc(FALSE)
 
-  # 6) Predict with one thread
+  # Guard: empty matrix -> tiny bias column
+  if (ncol(X) == 0L) {
+    X <- Matrix::Matrix(0, nrow = nrow(new_data), ncol = 1, sparse = TRUE)
+    colnames(X) <- ".bias0"
+  }
+
+  # 6) Predict (single thread)
   p_raw <- predict(fit$bst, newdata = X, nthread = 1)
-  rm(X); gc(verbose = FALSE)
+  rm(X); gc(FALSE)
 
   if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw
 }
+
 
 
 

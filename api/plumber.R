@@ -19,6 +19,8 @@ limit_threads <- function() {
 }
 limit_threads()
 
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
 # S2 predictors (clinical + labs + meta from s1) ----
 S2_PREDICTORS <- c(
   # Clinical predictors

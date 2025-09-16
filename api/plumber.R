@@ -765,15 +765,40 @@ function(req, res) {
   limit_threads()
   .log("s2_infer: start")
 
+  # ---- helper: load -> predict -> free (point B) --------------------
+  score_one_version <- function(key, path, meta_obj, new_data, calibrated, res) {
+    .log("s2_infer: loading ", key)
+    fit <- get_fit(key, path)                  # cache-aware loader
+    thr <- get_thr(fit, meta_obj, 0.50)
+
+    .log("s2_infer: predicting ", key)
+    p <- try(predict_s2_probs(fit, new_data, calibrated = calibrated), silent = TRUE)
+
+    # Drop the booster + prep immediately, then GC; optionally release cache
+    rm(fit); gc(verbose = FALSE)
+    if (!CACHE_MODELS) release_fit(key)
+    gc(FALSE); gc(TRUE)
+
+    if (inherits(p, "try-error")) {
+      res$status <- 400
+      .log("s2_infer: ", key, " prediction failed -> ", substr(as.character(p), 1, 240))
+      return(list(failed = TRUE,
+                  payload = list(error = paste(key, "prediction failed"),
+                                 message = as.character(p))))
+    }
+    list(failed = FALSE, thr = thr, p = p)
+  }
+
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
   feats_in <- as.data.frame(body$features, stringsAsFactors = FALSE)
   if (!nrow(feats_in)) feats_in <- feats_in[NA, , drop = FALSE]
   if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
+
   on.exit({
-  if (!CACHE_MODELS) { release_fit("v3"); release_fit("v4"); release_fit("v5") }
-  invisible(gc())
-}, add = TRUE)
+    if (!CACHE_MODELS) { release_fit("v3"); release_fit("v4"); release_fit("v5") }
+    invisible(gc())
+  }, add = TRUE)
 
   # ---------- schema padding (critical) ----------
   n <- nrow(feats_in)
@@ -803,62 +828,34 @@ function(req, res) {
     }
   }
 
-factorish <- c("site","ipdopd","sex","bgcombyn","adm.recent","waste","stunt",
-               "prior.care","travel.time.bin","urti","lrti","diarrhoeal","neuro",
-               "auf","ensapro","vomit.all","seiz","pfacleth","parenteral_screen","SFI_5cat")
-for (nm in intersect(factorish, names(feats_in))) {
-  if (!is.factor(feats_in[[nm]])) feats_in[[nm]] <- factor(feats_in[[nm]])
-}
+  factorish <- c("site","ipdopd","sex","bgcombyn","adm.recent","waste","stunt",
+                 "prior.care","travel.time.bin","urti","lrti","diarrhoeal","neuro",
+                 "auf","ensapro","vomit.all","seiz","pfacleth","parenteral_screen","SFI_5cat")
+  for (nm in intersect(factorish, names(feats_in))) {
+    if (!is.factor(feats_in[[nm]])) feats_in[[nm]] <- factor(feats_in[[nm]])
+  }
 
   # 2b) Pad ALL model predictors so downstream casting doesn’t fail
   miss_pred <- setdiff(S2_PREDICTORS, names(feats_in))
   if (length(miss_pred)) for (nm in miss_pred) feats_in[[nm]] <- NA
 
-  # ---------- v3 ----------
-  .log("s2_infer: loading v3")
-  v3_fit <- get_fit("v3", V3_PATH)                 # cache-aware
-  thr3   <- get_thr(v3_fit, v3_meta, 0.50)
-  .log("s2_infer: predicting v3")
-  p3 <- try(predict_s2_probs(v3_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p3, "try-error")) {
-    res$status <- 400
-    .log("s2_infer: v3 prediction failed -> ", substr(as.character(p3), 1, 240))
-    return(list(error = "v3 prediction failed", message = as.character(p3)))
-    }
-  rm(v3_fit); gc(verbose = FALSE)
-  if (!CACHE_MODELS) release_fit("v3")              # <-- extra cleanup when caching is off
+  # ---------- v3 (load -> predict -> free) ----------
+  v3 <- score_one_version("v3", V3_PATH, v3_meta, feats_in, use_cal, res)
+  if (v3$failed) return(v3$payload)
+  p3   <- v3$p
+  thr3 <- v3$thr
 
-# ---------- v4 ----------
-.log("s2_infer: loading v4")
-v4_fit <- get_fit("v4", V4_PATH)
-thr4   <- get_thr(v4_fit, v4_meta, 0.50)
+  # ---------- v4 (load -> predict -> free) ----------
+  v4 <- score_one_version("v4", V4_PATH, v4_meta, feats_in, use_cal, res)
+  if (v4$failed) return(v4$payload)
+  p4   <- v4$p
+  thr4 <- v4$thr
 
-.log("s2_infer: predicting v4")
-p4 <- try(predict_s2_probs(v4_fit, feats_in, calibrated = use_cal), silent = TRUE)
-if (inherits(p4, "try-error")) {
-  res$status <- 400
-  .log("s2_infer: v4 prediction failed -> ", substr(as.character(p4), 1, 240))
-  return(list(error = "v4 prediction failed", message = as.character(p4)))
-}
-
-rm(v4_fit); gc(verbose = FALSE)
-if (!CACHE_MODELS) release_fit("v4")
-
-# ---------- v5 ----------
-.log("s2_infer: loading v5")
-v5_fit <- get_fit("v5", V5_PATH)
-thr5   <- get_thr(v5_fit, v5_meta, 0.50)
-
-.log("s2_infer: predicting v5")
-p5 <- try(predict_s2_probs(v5_fit, feats_in, calibrated = use_cal), silent = TRUE)
-if (inherits(p5, "try-error")) {
-  res$status <- 400
-  .log("s2_infer: v5 prediction failed -> ", substr(as.character(p5), 1, 240))
-  return(list(error = "v5 prediction failed", message = as.character(p5)))
-}
-
-rm(v5_fit); gc(verbose = FALSE)
-if (!CACHE_MODELS) release_fit("v5")
+  # ---------- v5 (load -> predict -> free) ----------
+  v5 <- score_one_version("v5", V5_PATH, v5_meta, feats_in, use_cal, res)
+  if (v5$failed) return(v5$payload)
+  p5   <- v5$p
+  thr5 <- v5$thr
 
   # ---------- routing ----------
   .log("s2_infer: routing results")
@@ -876,9 +873,10 @@ if (!CACHE_MODELS) release_fit("v5")
   )
 
   .log("s2_infer: finished")
-  jsonlite::toJSON(resp, dataframe="rows", auto_unbox=TRUE, na="null")
+  jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
   return(resp)
 }
+
 
 
 

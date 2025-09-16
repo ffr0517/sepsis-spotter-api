@@ -19,6 +19,9 @@ limit_threads <- function() {
 }
 limit_threads()
 
+# Control model caching for low-RAM instances
+CACHE_MODELS <- tolower(Sys.getenv("CACHE_MODELS", "true")) %in% c("1","true","t","yes","y")
+
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
 # S2 predictors (clinical + labs + meta from s1) ----
@@ -52,11 +55,20 @@ S2_REQUIRED_STUB_COLS <- c(
 # ---------------------------------------------------------------------
 .load_env <- new.env(parent = emptyenv())
 
-get_fit <- function(key, path) {
-  if (!exists(key, envir = .load_env, inherits = FALSE)) {
-    assign(key, readRDS(path), envir = .load_env)
+get_fit <- function(key, path, cache = CACHE_MODELS) {
+  if (cache && exists(key, envir = .load_env, inherits = FALSE)) {
+    return(get(key, envir = .load_env, inherits = FALSE))
   }
-  get(key, envir = .load_env, inherits = FALSE)
+  obj <- readRDS(path)
+  if (cache) assign(key, obj, envir = .load_env)
+  obj
+}
+
+release_fit <- function(key) {
+  if (exists(key, envir = .load_env, inherits = FALSE)) {
+    rm(list = key, envir = .load_env)
+    invisible(gc())
+  }
 }
 
 is_loaded <- function(key) exists(key, envir = .load_env, inherits = FALSE)
@@ -567,18 +579,13 @@ function(req, res) {
 #* @post /s2_warmup
 function(req, res) {
   limit_threads()
-  .log("S2 warmup: loading v3...")
-  v3 <- get_fit("v3", V3_PATH); invisible(v3$bst); rm(v3); gc()
-  Sys.sleep(0.3)
-
-  .log("S2 warmup: loading v4...")
-  v4 <- get_fit("v4", V4_PATH); invisible(v4$bst); rm(v4); gc()
-  Sys.sleep(0.3)
-
-  .log("S2 warmup: loading v5...")
-  v5 <- get_fit("v5", V5_PATH); invisible(v5$bst); rm(v5); gc()
-  Sys.sleep(0.3)
-
+  if (!CACHE_MODELS) {
+    .log("S2 warmup skipped (CACHE_MODELS=FALSE).")
+    return(list(ok = TRUE, warmed = character()))
+  }
+  .log("S2 warmup: loading v3..."); v3 <- get_fit("v3", V3_PATH); invisible(v3$bst)
+  .log("S2 warmup: loading v4..."); v4 <- get_fit("v4", V4_PATH); invisible(v4$bst)
+  .log("S2 warmup: loading v5..."); v5 <- get_fit("v5", V5_PATH); invisible(v5$bst)
   .log("S2 warmup: done.")
   list(ok = TRUE, warmed = c("v3","v4","v5"))
 }
@@ -784,7 +791,7 @@ function(req, res) {
 
   # ---------- v3 ----------
   .log("s2_infer: loading v3")
-  v3_fit <- get_fit("v3", V3_PATH)
+  v3_fit <- get_fit("v3", V3_PATH)                 # cache-aware
   thr3   <- get_thr(v3_fit, v3_meta, 0.50)
   .log("s2_infer: predicting v3")
   p3 <- try(predict_s2_probs(v3_fit, feats_in, calibrated = use_cal), silent = TRUE)
@@ -792,34 +799,41 @@ function(req, res) {
     res$status <- 400
     .log("s2_infer: v3 prediction failed -> ", substr(as.character(p3), 1, 240))
     return(list(error = "v3 prediction failed", message = as.character(p3)))
-  }
+    }
   rm(v3_fit); gc(verbose = FALSE)
+  if (!CACHE_MODELS) release_fit("v3")              # <-- extra cleanup when caching is off
 
-  # ---------- v4 ----------
-  .log("s2_infer: loading v4")
-  v4_fit <- get_fit("v4", V4_PATH)
-  thr4   <- get_thr(v4_fit, v4_meta, 0.50)
-  .log("s2_infer: predicting v4")
-  p4 <- try(predict_s2_probs(v4_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p4, "try-error")) {
-    res$status <- 400
-    .log("s2_infer: v4 prediction failed -> ", substr(as.character(p4), 1, 240))
-    return(list(error = "v4 prediction failed", message = as.character(p4)))
-  }
-  rm(v4_fit); gc(verbose = FALSE)
+# ---------- v4 ----------
+.log("s2_infer: loading v4")
+v4_fit <- get_fit("v4", V4_PATH)
+thr4   <- get_thr(v4_fit, v4_meta, 0.50)
 
-  # ---------- v5 ----------
-  .log("s2_infer: loading v5")
-  v5_fit <- get_fit("v5", V5_PATH)
-  thr5   <- get_thr(v5_fit, v5_meta, 0.50)
-  .log("s2_infer: predicting v5")
-  p5 <- try(predict_s2_probs(v5_fit, feats_in, calibrated = use_cal), silent = TRUE)
-  if (inherits(p5, "try-error")) {
-    res$status <- 400
-    .log("s2_infer: v5 prediction failed -> ", substr(as.character(p5), 1, 240))
-    return(list(error = "v5 prediction failed", message = as.character(p5)))
-  }
-  rm(v5_fit); gc(verbose = FALSE)
+.log("s2_infer: predicting v4")
+p4 <- try(predict_s2_probs(v4_fit, feats_in, calibrated = use_cal), silent = TRUE)
+if (inherits(p4, "try-error")) {
+  res$status <- 400
+  .log("s2_infer: v4 prediction failed -> ", substr(as.character(p4), 1, 240))
+  return(list(error = "v4 prediction failed", message = as.character(p4)))
+}
+
+rm(v4_fit); gc(verbose = FALSE)
+if (!CACHE_MODELS) release_fit("v4")
+
+# ---------- v5 ----------
+.log("s2_infer: loading v5")
+v5_fit <- get_fit("v5", V5_PATH)
+thr5   <- get_thr(v5_fit, v5_meta, 0.50)
+
+.log("s2_infer: predicting v5")
+p5 <- try(predict_s2_probs(v5_fit, feats_in, calibrated = use_cal), silent = TRUE)
+if (inherits(p5, "try-error")) {
+  res$status <- 400
+  .log("s2_infer: v5 prediction failed -> ", substr(as.character(p5), 1, 240))
+  return(list(error = "v5 prediction failed", message = as.character(p5)))
+}
+
+rm(v5_fit); gc(verbose = FALSE)
+if (!CACHE_MODELS) release_fit("v5")
 
   # ---------- routing ----------
   .log("s2_infer: routing results")

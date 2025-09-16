@@ -285,6 +285,7 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
 
   # 2) Ensure ALL variables referenced by the recipe exist
   needed <- unique(summary(fit$prep)$variable)
+
   proto_pool <- list()
   if (!is.null(fit$predictor_ptypes)) proto_pool <- c(proto_pool, fit$predictor_ptypes)
   if (!is.null(fit$id_role_ptypes))   proto_pool <- c(proto_pool, fit$id_role_ptypes)
@@ -294,7 +295,6 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   if (length(miss)) {
     suffix <- if (length(miss) > 12) " … (more)" else ""
     .log("s2_infer: adding missing vars -> ", paste(utils::head(miss, 12), collapse = ", "), suffix)
-
     n <- nrow(new_data)
     for (nm in miss) {
       proto <- proto_pool[[nm]]
@@ -316,20 +316,7 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
     }
   }
 
-  # ---- Smart binary coercion (single pass, warning-free) ----
-  coerce_bin_safely <- function(x) {
-    if (is.character(x)) {
-      x <- trimws(x); x[x == ""] <- NA
-      xi <- suppressWarnings(as.integer(x))
-    } else if (is.logical(x)) {
-      xi <- as.integer(x)
-    } else {
-      xi <- suppressWarnings(as.integer(x))
-    }
-    xi[is.na(xi)] <- 0L
-    pmin.int(pmax.int(xi, 0L), 1L)
-  }
-
+  # ---- SMART IMPUTE + FACTORIZE (single pass!) --------------------------
   bin_cat <- c(
     "bgcombyn","adm.recent","waste","stunt","prior.care","travel.time.bin",
     "diarrhoeal","ensapro","vomit.all","seiz","pfacleth","crt.long",
@@ -337,41 +324,54 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
     "sev.pneumo","infection","parenteral_screen"
   )
 
-  for (nm in intersect(bin_cat, names(new_data))) {
-    xi <- coerce_bin_safely(new_data[[nm]])
-    new_data[[nm]] <- factor(xi, levels = c(0L, 1L))
+  if (length(intersect(bin_cat, names(new_data)))) {
+    for (nm in intersect(bin_cat, names(new_data))) {
+      x <- new_data[[nm]]
+      # NA / "" -> 0; coerce to integer; clamp to {0,1}; THEN factor with levels 0,1
+      if (is.character(x)) {
+        x <- trimws(x); x[x == ""] <- NA
+        xi <- suppressWarnings(as.integer(x))
+      } else if (is.logical(x)) {
+        xi <- as.integer(x)
+      } else {
+        xi <- suppressWarnings(as.integer(x))
+      }
+      xi[is.na(xi)] <- 0L
+      xi[!(xi %in% c(0L,1L))] <- 0L
+      new_data[[nm]] <- factor(xi, levels = c(0L,1L))
+    }
   }
-  # -----------------------------------------------------------
+  # ----------------------------------------------------------------------
 
-  # 3) Bake
+  # 3) Bake safely
   baked <- bake(fit$prep, new_data = new_data)
 
   # 4) Align to training feature set (add any missing with 0)
   feats <- fit$features
   miss_feats <- setdiff(feats, names(baked))
-  if (length(miss_feats)) for (mc in miss_feats) baked[[mc]] <- 0
+  if (length(miss_feats)) {
+    for (mc in miss_feats) baked[[mc]] <- 0
+  }
   baked <- baked[, feats, drop = FALSE]
 
-  # 5) Sparse design (no dense copy)
+  # 5) Build sparse design without dense copy
   fml <- as.formula(paste("~", paste(sprintf("`%s`", feats), collapse = " + "), "- 1"))
   X <- Matrix::sparse.model.matrix(fml, data = baked)
-  rm(baked); gc(FALSE)
+  rm(baked); gc(verbose = FALSE)
 
-  # Guard: empty matrix -> tiny bias column
-  if (ncol(X) == 0L) {
+  # Fallback if design ended up empty for any reason
+  if (is.null(dim(X)) || ncol(X) == 0L) {
+    .log("s2_infer: sparse matrix had 0 cols; injecting bias col")
     X <- Matrix::Matrix(0, nrow = nrow(new_data), ncol = 1, sparse = TRUE)
     colnames(X) <- ".bias0"
   }
 
-  # 6) Predict (single thread)
+  # 6) Predict with one thread
   p_raw <- predict(fit$bst, newdata = X, nthread = 1)
-  rm(X); gc(FALSE)
+  rm(X); gc(verbose = FALSE)
 
   if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw
 }
-
-
-
 
 prop_excess <- function(p, thr, eps = 1e-6) pmax(0, (p - thr) / pmax(thr, eps))
 

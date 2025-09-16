@@ -746,7 +746,6 @@ return(resp)
 # S2 inference (v3/v4/v5 -> 4-class with margin-normalised tie-breaks)
 # ---------------------------------------------------------------------
 #* @post /s2_infer
-#* @post /s2_infer
 function(req, res) {
   limit_threads()
   .log("s2_infer: start")
@@ -756,6 +755,12 @@ function(req, res) {
   if (!nrow(feats_in)) feats_in <- feats_in[NA, , drop = FALSE]
   if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
+  on.exit({
+  if (!CACHE_MODELS) {
+    release_fit("v3"); release_fit("v4"); release_fit("v5")
+  }
+  invisible(gc())
+}, add = TRUE)
 
   # ---------- schema padding (critical) ----------
   n <- nrow(feats_in)
@@ -784,6 +789,13 @@ function(req, res) {
       feats_in[[nm]] <- NA_real_
     }
   }
+
+factorish <- c("site","ipdopd","sex","bgcombyn","adm.recent","waste","stunt",
+               "prior.care","travel.time.bin","urti","lrti","diarrhoeal","neuro",
+               "auf","ensapro","vomit.all","seiz","pfacleth","parenteral_screen","SFI_5cat")
+for (nm in intersect(factorish, names(feats_in))) {
+  if (!is.factor(feats_in[[nm]])) feats_in[[nm]] <- factor(feats_in[[nm]])
+}
 
   # 2b) Pad ALL model predictors so downstream casting doesn’t fail
   miss_pred <- setdiff(S2_PREDICTORS, names(feats_in))
@@ -851,7 +863,8 @@ if (!CACHE_MODELS) release_fit("v5")
   )
 
   .log("s2_infer: finished")
-  jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
+  jsonlite::toJSON(resp, dataframe="rows", auto_unbox=TRUE, na="null")
+  return(resp)
 }
 
 

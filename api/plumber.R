@@ -284,57 +284,54 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   }
 
   # 2) Ensure ALL variables referenced by the recipe exist
-  #    (recipes needs them even if later removed)
   needed <- unique(summary(fit$prep)$variable)
-
-  # Build a prototype pool from what we saved in the bundle
   proto_pool <- list()
-  if (!is.null(fit$predictor_ptypes))    proto_pool <- c(proto_pool, fit$predictor_ptypes)
-  if (!is.null(fit$id_role_ptypes))      proto_pool <- c(proto_pool, fit$id_role_ptypes)
-  if (!is.null(fit$outcome_ptypes))      proto_pool <- c(proto_pool, fit$outcome_ptypes)
+  if (!is.null(fit$predictor_ptypes)) proto_pool <- c(proto_pool, fit$predictor_ptypes)
+  if (!is.null(fit$id_role_ptypes))   proto_pool <- c(proto_pool, fit$id_role_ptypes)
+  if (!is.null(fit$outcome_ptypes))   proto_pool <- c(proto_pool, fit$outcome_ptypes)
 
   miss <- setdiff(needed, names(new_data))
+  if (length(miss)) {
+    suffix <- if (length(miss) > 12) " … (more)" else ""
+    .log("s2_infer: adding missing vars -> ", paste(utils::head(miss, 12), collapse = ", "), suffix)
 
-if (length(miss)) {
-  # short log of what's being added
-  suffix <- if (length(miss) > 12) " … (more)" else ""
-  .log(
-    "s2_infer: adding missing vars -> ",
-    paste(utils::head(miss, 12), collapse = ", "),
-    suffix
-  )
-
-  n <- nrow(new_data)
-  for (nm in miss) {
-    proto <- proto_pool[[nm]]
-    if (!is.null(proto)) {
-      new_data[[nm]] <- vctrs::vec_init(proto, n)
-    } else {
-      # Fallback heuristics: ids/labels as character; obvious binary flags as integer; else numeric
-      if (grepl("^(label|site|ipdopd)$", nm)) {
+    n <- nrow(new_data)
+    for (nm in miss) {
+      proto <- proto_pool[[nm]]
+      if (!is.null(proto)) {
+        new_data[[nm]] <- vctrs::vec_init(proto, n)
+      } else if (grepl("^(label|site|ipdopd)$", nm)) {
         new_data[[nm]] <- rep(NA_character_, n)
-
       } else if (grepl("^(urti|lrti|neuro|auf|prop_handoff)$", nm)) {
-        # these were 0/1-ish flags in training
         new_data[[nm]] <- rep(NA_integer_, n)
-
       } else if (grepl("^syndrome\\.(resp|nonresp)$", nm)) {
-        # also dummy/flag-like
         new_data[[nm]] <- rep(NA_integer_, n)
-
       } else if (grepl("^(ipw|LqSOFA)$", nm)) {
-        # numeric scores/weights
         new_data[[nm]] <- rep(NA_real_, n)
-
       } else if (grepl("^(na[_]|na_ind_|.*(_X0|_X1|_unknown|_new)$)", nm)) {
         new_data[[nm]] <- rep(NA_integer_, n)
-
       } else {
         new_data[[nm]] <- rep(NA_real_, n)
       }
     }
   }
-}
+
+  ## >>> INSERTED: smart-impute + factor-ize binary flags BEFORE bake() <<<
+  bin_cat <- c(
+    "bgcombyn","adm.recent","waste","stunt","prior.care","travel.time.bin",
+    "diarrhoeal","ensapro","vomit.all","seiz","pfacleth","crt.long",
+    "not.alert","danger.sign","syndrome.resp","syndrome.nonresp","pneumo",
+    "sev.pneumo","infection","parenteral_screen"
+  )
+
+  for (nm in intersect(bin_cat, names(new_data))) {
+    x <- new_data[[nm]]
+    # treat NA/"" as 0; coerce to integer then factor(0,1)
+    xi <- as.integer(ifelse(is.na(x) | x == "", 0L, as.integer(x)))
+    xi[!xi %in% c(0L, 1L)] <- 0L
+    new_data[[nm]] <- factor(xi, levels = c(0L, 1L))
+  }
+  ## <<< END INSERTION <<<
 
   # 3) Now bake safely
   baked <- bake(fit$prep, new_data = new_data)
@@ -356,6 +353,7 @@ if (length(miss)) {
 
   if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw
 }
+
 
 
 prop_excess <- function(p, thr, eps = 1e-6) pmax(0, (p - thr) / pmax(thr, eps))

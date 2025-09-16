@@ -19,6 +19,29 @@ limit_threads <- function() {
 }
 limit_threads()
 
+# S2 predictors (clinical + labs + meta from s1) ----
+S2_PREDICTORS <- c(
+  # Clinical predictors
+  "age.months","sex","bgcombyn","adm.recent","wfaz","waste","stunt","cidysymp",
+  "prior.care","travel.time.bin","diarrhoeal","pneumo","sev.pneumo","ensapro",
+  "vomit.all","seiz","pfacleth","not.alert","danger.sign","hr.all","rr.all",
+  "oxy.ra","envhtemp","crt.long","parenteral_screen","SIRS_num",
+  
+  # Biomarkers / lab assays
+  "ANG1","ANG2","CHI3L","CRP","CXCl10","IL1ra","IL6","IL8","IL10","PROC",
+  "TNFR1","STREM1","VEGFR1","supar","lblac","lbglu","enescbchb1",
+  
+  # Meta from S1
+  "v1_pred_Severe", "v1_pred_Other", "v2_pred_NOTSevere", "v2_pred_Other"
+)
+
+S2_REQUIRED_STUB_COLS <- c(
+  "label","w_final",".case_w",
+  "SFI_bin_severe_vs_other","SFI_bin_probSev_vs_other","SFI_bin_probNS_vs_other",
+  "site","ipdopd","outcome.binary","infection","weight","weight_bin",
+  "strata_var","n_stratum","p_stratum","SFI_5cat"
+)
+
 # ---------------------------------------------------------------------
 # Lazy model loader
 # ---------------------------------------------------------------------
@@ -698,7 +721,7 @@ return(resp)
 # ---------------------------------------------------------------------
 #* @post /s2_infer
 function(req, res) {
-  limit_threads()  # ensure per-request too
+  limit_threads()
   .log("s2_infer: start")
 
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
@@ -706,6 +729,35 @@ function(req, res) {
   if (!nrow(feats_in)) feats_in <- feats_in[NA, , drop = FALSE]
   if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
+
+  # ---------- schema padding (critical) ----------
+  n <- nrow(feats_in)
+
+  # 2a) Ensure training-remembered columns exist (so bake() won't error)
+  add_if_missing <- function(df, nm, val) { if (!nm %in% names(df)) df[[nm]] <- val; df }
+  feats_in <- add_if_missing(feats_in, "w_final",  rep(1, n))
+  feats_in <- add_if_missing(feats_in, ".case_w",  rep(1, n))
+
+  # Outcomes remembered by the recipe; give factor levels to be safe
+  lvl_sev  <- c("Other","Severe")
+  lvl_psev <- c("Other","Probable Severe")
+  lvl_pns  <- c("Other","Probable Non-Severe")
+  if (!"SFI_bin_severe_vs_other" %in% names(feats_in))
+    feats_in$SFI_bin_severe_vs_other <- factor(rep("Other", n), levels = lvl_sev)
+  if (!"SFI_bin_probSev_vs_other" %in% names(feats_in))
+    feats_in$SFI_bin_probSev_vs_other <- factor(rep("Other", n), levels = lvl_psev)
+  if (!"SFI_bin_probNS_vs_other" %in% names(feats_in))
+    feats_in$SFI_bin_probNS_vs_other  <- factor(rep("Other", n), levels = lvl_pns)
+
+  # Nuisance training columns the recipe saw — types are unimportant since step_rm() will drop them
+  for (nm in c("site","ipdopd","outcome.binary","infection","weight","weight_bin",
+               "strata_var","n_stratum","p_stratum","SFI_5cat")) {
+    if (!nm %in% names(feats_in)) feats_in[[nm]] <- NA
+  }
+
+  # 2b) Pad ALL model predictors so downstream casting doesn’t fail
+  miss_pred <- setdiff(S2_PREDICTORS, names(feats_in))
+  if (length(miss_pred)) for (nm in miss_pred) feats_in[[nm]] <- NA
 
   # ---------- v3 ----------
   .log("s2_infer: loading v3")
@@ -715,10 +767,9 @@ function(req, res) {
   p3 <- try(predict_s2_probs(v3_fit, feats_in, calibrated = use_cal), silent = TRUE)
   if (inherits(p3, "try-error")) {
     res$status <- 400
-    .log("s2_infer: v3 prediction failed -> ", substr(as.character(p3), 1, 200))
-  return(list(error = "v3 prediction failed", message = as.character(p3)))
+    .log("s2_infer: v3 prediction failed -> ", substr(as.character(p3), 1, 240))
+    return(list(error = "v3 prediction failed", message = as.character(p3)))
   }
-  .log("s2_infer: v3 done")
   rm(v3_fit); gc(verbose = FALSE)
 
   # ---------- v4 ----------
@@ -729,10 +780,9 @@ function(req, res) {
   p4 <- try(predict_s2_probs(v4_fit, feats_in, calibrated = use_cal), silent = TRUE)
   if (inherits(p4, "try-error")) {
     res$status <- 400
-    .log("s2_infer: v4 prediction failed -> ", substr(as.character(p4), 1, 200))
+    .log("s2_infer: v4 prediction failed -> ", substr(as.character(p4), 1, 240))
     return(list(error = "v4 prediction failed", message = as.character(p4)))
   }
-  .log("s2_infer: v4 done")
   rm(v4_fit); gc(verbose = FALSE)
 
   # ---------- v5 ----------
@@ -742,11 +792,10 @@ function(req, res) {
   .log("s2_infer: predicting v5")
   p5 <- try(predict_s2_probs(v5_fit, feats_in, calibrated = use_cal), silent = TRUE)
   if (inherits(p5, "try-error")) {
-  res$status <- 400
-  .log("s2_infer: v5 prediction failed -> ", substr(as.character(p5), 1, 200))
-  return(list(error = "v5 prediction failed", message = as.character(p5)))
+    res$status <- 400
+    .log("s2_infer: v5 prediction failed -> ", substr(as.character(p5), 1, 240))
+    return(list(error = "v5 prediction failed", message = as.character(p5)))
   }
-  .log("s2_infer: v5 done")
   rm(v5_fit); gc(verbose = FALSE)
 
   # ---------- routing ----------
@@ -767,5 +816,6 @@ function(req, res) {
   .log("s2_infer: finished")
   jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
 }
+
 
 

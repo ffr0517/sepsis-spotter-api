@@ -6,6 +6,8 @@ library(workflows)
 library(rlang)
 library(vctrs)
 
+
+
 limit_threads <- function() {
   # BLAS/OpenMP families
   Sys.setenv(
@@ -273,6 +275,121 @@ cast_to_ptypes <- function(df, ptypes) {
   df
 }
 
+# --- Shared bake-once + sparse builders (top-level) --------------------
+# Re-usable helpers so we don't duplicate inside predict_s2_probs()
+# and so /s2_infer can reuse a single baked frame across v3/v4/v5.
+bake_once_with <- function(fit, new_data) {
+  # Cast predictor types if saved
+  if (!is.null(fit$predictor_ptypes)) {
+    new_data <- cast_to_ptypes(new_data, fit$predictor_ptypes)
+  } else {
+    new_data <- as.data.frame(new_data, stringsAsFactors = FALSE)
+  }
+
+  # Ensure all recipe-referenced vars exist
+  needed <- unique(summary(fit$prep)$variable)
+  proto_pool <- list()
+  if (!is.null(fit$predictor_ptypes)) proto_pool <- c(proto_pool, fit$predictor_ptypes)
+  if (!is.null(fit$id_role_ptypes))   proto_pool <- c(proto_pool, fit$id_role_ptypes)
+  if (!is.null(fit$outcome_ptypes))   proto_pool <- c(proto_pool, fit$outcome_ptypes)
+
+  miss <- setdiff(needed, names(new_data))
+  if (length(miss)) {
+    n <- nrow(new_data)
+    for (nm in miss) {
+      proto <- proto_pool[[nm]]
+      if (!is.null(proto)) {
+        new_data[[nm]] <- vctrs::vec_init(proto, n)
+      } else if (grepl("^(label|site|ipdopd)$", nm)) {
+        new_data[[nm]] <- rep(NA_character_, n)
+      } else if (grepl("^(urti|lrti|neuro|auf|prop_handoff)$", nm)) {
+        new_data[[nm]] <- rep(NA_integer_, n)
+      } else if (grepl("^syndrome\.(resp|nonresp)$", nm)) {
+        new_data[[nm]] <- rep(NA_integer_, n)
+      } else if (grepl("^(ipw|LqSOFA)$", nm)) {
+        new_data[[nm]] <- rep(NA_real_, n)
+      } else if (grepl("^(na[_]|na_ind_|.*(_X0|_X1|_unknown|_new)$)", nm)) {
+        new_data[[nm]] <- rep(NA_integer_, n)
+      } else {
+        new_data[[nm]] <- rep(NA_real_, n)
+      }
+    }
+  }
+
+  # Smart factorize (binary to {0,1} factors)
+  bin_cat <- c(
+    "bgcombyn","adm.recent","waste","stunt","prior.care","travel.time.bin",
+    "diarrhoeal","ensapro","vomit.all","seiz","pfacleth","crt.long",
+    "not.alert","danger.sign","syndrome.resp","syndrome.nonresp","pneumo",
+    "sev.pneumo","infection","parenteral_screen"
+  )
+  if (length(intersect(bin_cat, names(new_data)))) {
+    for (nm in intersect(bin_cat, names(new_data))) {
+      x <- new_data[[nm]]
+      if (is.character(x)) {
+        x <- trimws(x); x[x == ""] <- NA
+        xi <- suppressWarnings(as.integer(x))
+      } else if (is.logical(x)) {
+        xi <- as.integer(x)
+      } else {
+        xi <- suppressWarnings(as.integer(x))
+      }
+      xi[is.na(xi)] <- 0L
+      xi[!(xi %in% c(0L,1L))] <- 0L
+      new_data[[nm]] <- factor(xi, levels = c(0L,1L))
+    }
+  }
+
+  # Bake once using the fit's recipe
+  bake(fit$prep, new_data = new_data)
+}
+
+build_sparse_for <- function(baked, features) {
+  miss_feats <- setdiff(features, names(baked))
+  if (length(miss_feats)) for (mc in miss_feats) baked[[mc]] <- 0
+  baked <- baked[, features, drop = FALSE]
+  fml <- as.formula(paste("~", paste(sprintf("`%s`", features), collapse = " + "), "- 1"))
+  X <- Matrix::sparse.model.matrix(fml, data = baked)
+  if (is.null(dim(X)) || ncol(X) == 0L) {
+    .log("s2_infer: sparse matrix had 0 cols; injecting bias col")
+    X <- Matrix::Matrix(0, nrow = nrow(baked), ncol = 1, sparse = TRUE)
+    colnames(X) <- ".bias0"
+  }
+  X
+}
+
+  for (nm in names(ptypes)) {
+    proto <- ptypes[[nm]]
+    x <- df[[nm]]
+    if (is.factor(proto)) {
+      lv <- levels(proto)
+      if (is.numeric(x) || is.integer(x) || is.logical(x)) x <- to_bin_char(x)
+      x <- trimws(as.character(x))
+      if (length(lv) == 2L) {
+        low <- lv[1]; high <- lv[2]
+        if (all(c("0","1") %in% lv)) {
+          x <- ifelse(x %in% c("0","1"), x, NA_character_)
+        } else {
+          x <- ifelse(x == "0", low, ifelse(x == "1", high, x))
+        }
+      }
+      df[[nm]] <- factor(ifelse(x %in% lv, x, NA_character_), levels = lv)
+    } else if (is.numeric(proto)) {
+      if (!is.numeric(x)) df[[nm]] <- suppressWarnings(as.numeric(x))
+    } else if (is.integer(proto)) {
+      if (!is.integer(x)) df[[nm]] <- suppressWarnings(as.integer(x))
+    } else if (is.logical(proto)) {
+      if (!is.logical(x)) {
+        xl <- tolower(as.character(x))
+        df[[nm]] <- xl %in% c("1","true","t","yes","y")
+      }
+    } else if (is.character(proto)) {
+      if (!is.character(x)) df[[nm]] <- as.character(x)
+    }
+  }
+  df
+}
+
 predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   stopifnot(!is.null(fit$prep), !is.null(fit$bst))
 
@@ -316,7 +433,7 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
     }
   }
 
-  # ---- SMART IMPUTE + FACTORIZE (single pass!) --------------------------
+    # ---- SMART IMPUTE + FACTORIZE (single pass!) --------------------------
   bin_cat <- c(
     "bgcombyn","adm.recent","waste","stunt","prior.care","travel.time.bin",
     "diarrhoeal","ensapro","vomit.all","seiz","pfacleth","crt.long",
@@ -808,6 +925,29 @@ function(req, res) {
   feats_in <- add_if_missing(feats_in, "w_final", rep(1, n))
   feats_in <- add_if_missing(feats_in, ".case_w", rep(1, n))
 
+    LAB_VARS <- c("ANG1","ANG2","CHI3L","CRP","CXCl10","IL1ra","IL6","IL8","IL10",
+                "PROC","TNFR1","STREM1","VEGFR1","supar","lblac","lbglu","enescbchb1")
+
+  labs_present <- intersect(LAB_VARS, names(feats_in))
+  have_labs_n <- if (length(labs_present)) sum(!is.na(unlist(feats_in[, labs_present, drop = FALSE]))) else 0L
+
+  # Robust checks even if columns are missing entirely
+  na_oxy  <- (!"oxy.ra"   %in% names(feats_in))  || isTRUE(is.na(feats_in$oxy.ra[1]))
+  na_sirs <- (!"SIRS_num" %in% names(feats_in)) || isTRUE(is.na(feats_in$SIRS_num[1]))
+  na_both_oxy_sirs <- na_oxy && na_sirs
+
+  allow_heavy_impute <- isTRUE(body$allow_heavy_impute)
+
+  if (!allow_heavy_impute && have_labs_n < 1 && na_both_oxy_sirs) {
+    res$status <- 422
+    .log("s2_infer: aborted early (too sparse: no labs + oxy/SIRS missing)")
+    return(list(
+      error = "S2 requires more signal",
+      reason = "no_labs_and_no_oxy_or_SIRS",
+      needed = list(any_lab = LAB_VARS, or = c("oxy.ra", "SIRS_num"))
+    ))
+  }
+
   # Outcomes remembered by the recipe; give factor levels to be safe
   lvl_sev  <- c("Other","Severe")
   lvl_psev <- c("Other","Probable Severe")
@@ -839,23 +979,41 @@ function(req, res) {
   miss_pred <- setdiff(S2_PREDICTORS, names(feats_in))
   if (length(miss_pred)) for (nm in miss_pred) feats_in[[nm]] <- NA
 
-  # ---------- v3 (load -> predict -> free) ----------
-  v3 <- score_one_version("v3", V3_PATH, v3_meta, feats_in, use_cal, res)
-  if (v3$failed) return(v3$payload)
-  p3   <- v3$p
-  thr3 <- v3$thr
+  # ---------- v3 load (for baking) ----------
+.log("s2_infer: loading v3 (baseline bake)")
+v3_fit <- get_fit("v3", V3_PATH)  # keep object to bake
+thr3   <- get_thr(v3_fit, v3_meta, 0.50)
 
-  # ---------- v4 (load -> predict -> free) ----------
-  v4 <- score_one_version("v4", V4_PATH, v4_meta, feats_in, use_cal, res)
-  if (v4$failed) return(v4$payload)
-  p4   <- v4$p
-  thr4 <- v4$thr
+# Bake ONCE with v3 recipe (covers indicate_na, bagged impute, dummies, etc.)
+.log("s2_infer: baking once via v3 recipe")
+baked_once <- bake_once_with(v3_fit, feats_in)
 
-  # ---------- v5 (load -> predict -> free) ----------
-  v5 <- score_one_version("v5", V5_PATH, v5_meta, feats_in, use_cal, res)
-  if (v5$failed) return(v5$payload)
-  p5   <- v5$p
-  thr5 <- v5$thr
+# Predict v3 using reused baked data
+.log("s2_infer: predicting v3")
+X3 <- build_sparse_for(baked_once, v3_fit$features)
+p3_raw <- predict(v3_fit$bst, newdata = X3, nthread = 1); rm(X3); gc(FALSE)
+p3 <- if (isTRUE(use_cal)) apply_calibrator(p3_raw, v3_fit$calibrator) else p3_raw
+
+# Free v3 if not caching
+rm(p3_raw); if (!CACHE_MODELS) release_fit("v3"); rm(v3_fit); gc()
+
+# ---------- v4 ----------
+.log("s2_infer: loading v4")
+v4_fit <- get_fit("v4", V4_PATH); thr4 <- get_thr(v4_fit, v4_meta, 0.50)
+.log("s2_infer: predicting v4 (reuse baked)")
+X4 <- build_sparse_for(baked_once, v4_fit$features)
+p4_raw <- predict(v4_fit$bst, newdata = X4, nthread = 1); rm(X4); gc(FALSE)
+p4 <- if (isTRUE(use_cal)) apply_calibrator(p4_raw, v4_fit$calibrator) else p4_raw
+rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
+
+# ---------- v5 ----------
+.log("s2_infer: loading v5")
+v5_fit <- get_fit("v5", V5_PATH); thr5 <- get_thr(v5_fit, v5_meta, 0.50)
+.log("s2_infer: predicting v5 (reuse baked)")
+X5 <- build_sparse_for(baked_once, v5_fit$features)
+p5_raw <- predict(v5_fit$bst, newdata = X5, nthread = 1); rm(X5); gc(FALSE)
+p5 <- if (isTRUE(use_cal)) apply_calibrator(p5_raw, v5_fit$calibrator) else p5_raw
+rm(p5_raw); if (!CACHE_MODELS) release_fit("v5"); rm(v5_fit); gc()
 
   # ---------- routing ----------
   .log("s2_infer: routing results")

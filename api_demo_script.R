@@ -9,12 +9,12 @@ BASE_URL <- Sys.getenv("SEPSIS_SPOTTER_URL", unset = "https://sepsis-spotter.onr
 # http helpers ----
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
-post_json <- function(url, payload, retries = 6, wait = 2) {
+post_json <- function(url, payload, retries = 6, wait = 2, timeout_s = 30) {
   last_err_msg <- NULL
   for (i in seq_len(retries)) {
     resp <- try({
       req <- httr2::request(url) |>
-        httr2::req_timeout(30) |>
+        httr2::req_timeout(timeout_s) |>
         httr2::req_headers(
           "Content-Type" = "application/json",
           "User-Agent"   = "sepsis-spotter-test/1.0"
@@ -25,7 +25,7 @@ post_json <- function(url, payload, retries = 6, wait = 2) {
     
     if (inherits(resp, "try-error")) {
       last_err_msg <- conditionMessage(attr(resp, "condition") %||% simpleError("request failed"))
-      Sys.sleep(wait * (1.5^(i - 1)) + runif(1, 0, 0.5))  # exp backoff + jitter
+      Sys.sleep(wait * (1.5^(i - 1)) + runif(1, 0, 0.5))
       next
     }
     
@@ -37,13 +37,12 @@ post_json <- function(url, payload, retries = 6, wait = 2) {
     }
     if (status >= 400) {
       cat("Server error body:\n", httr2::resp_body_string(resp), "\n")
-      stop(sprintf("HTTP %s %s", status, httr2::resp_status_desc(resp)))
+      stop(sprintf("HTTP %s %s", httr2::resp_status(resp), httr2::resp_status_desc(resp)))
     }
     return(httr2::resp_body_json(resp, simplifyVector = TRUE))
   }
   stop("Failed after retries: ", last_err_msg %||% "unknown")
 }
-
 get_json <- function(url) {
   resp <- httr2::request(url) |> httr2::req_timeout(15) |> httr2::req_perform()
   if (httr2::resp_status(resp) >= 400) {
@@ -143,24 +142,20 @@ s2_features <- modifyList(
 
 # calling s2 (calibrated and raw) ----
 cat("\nCalling /s2_infer (calibrated=TRUE) ...\n")
-s2_out_cal <- post_json(
-  paste0(BASE_URL, "/s2_infer"),
-  list(features = s2_features, apply_calibration = TRUE)
-)
+s2_out_cal <- post_json(paste0(BASE_URL, "/s2_infer"),
+                        list(features = s2_features, apply_calibration = TRUE),
+                        timeout_s = 180)
 
 cat("\nS2 (calibrated) result:\n")
 print(s2_out_cal)
 
 cat("\nCalling /s2_infer (calibrated=FALSE) ...\n")
-s2_out_raw <- post_json(
-  paste0(BASE_URL, "/s2_infer"),
-  list(features = s2_features, apply_calibration = FALSE)
-)
+s2_out_raw <- post_json(paste0(BASE_URL, "/s2_infer"),
+                        list(features = s2_features, apply_calibration = FALSE),
+                        timeout_s = 180)
 
 cat("\nS2 (raw) result:\n")
 print(s2_out_raw)
-
-# pretty summary ----
 cat("\n--- Summary ---\n")
 fmt_row <- function(x) {
   if (is.character(x) && length(x) == 1L && grepl("^\\s*([\\[{])", x)) {

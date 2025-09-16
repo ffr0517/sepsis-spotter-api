@@ -351,7 +351,7 @@ if (length(miss)) {
   rm(baked); gc(verbose = FALSE)
 
   # 6) Predict with one thread
-  p_raw <- xgboost::predict(fit$bst, newdata = X, nthread = 1)
+  p_raw <- predict(fit$bst, newdata = X, nthread = 1)
   rm(X); gc(verbose = FALSE)
 
   if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw

@@ -480,7 +480,7 @@ predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   }
 
   # 6) Predict with one thread
-  p_raw <- predict(fit$bst, newdata = X, nthread = 1)
+  p_raw <- predict(fit$bst, newdata = as.matrix(X), nthread = 1)
   rm(X); gc(verbose = FALSE)
 
   if (isTRUE(calibrated)) apply_calibrator(p_raw, fit$calibrator) else p_raw
@@ -1032,7 +1032,7 @@ if (nnz3 == 0L) {
     present_feature_cols = head(v3_fit$features, 20L)
   ))
 }
-p3_raw <- predict(v3_fit$bst, newdata = X3, nthread = 1); rm(X3); gc(FALSE)
+p3_raw <- predict(v3_fit$bst, newdata = as.matrix(X3), nthread = 1); rm(X3); gc(FALSE)
 p3 <- if (isTRUE(use_cal)) apply_calibrator(p3_raw, v3_fit$calibrator) else p3_raw
 
 # Free v3 if not caching
@@ -1057,7 +1057,7 @@ if (nnz4 == 0L) {
     present_feature_cols = head(v4_fit$features, 20L)
   ))
 }
-p4_raw <- predict(v4_fit$bst, newdata = X4, nthread = 1); rm(X4); gc(FALSE)
+p4_raw <- predict(v4_fit$bst, newdata = as.matrix(X4), nthread = 1); rm(X4); gc(FALSE)
 p4 <- if (isTRUE(use_cal)) apply_calibrator(p4_raw, v4_fit$calibrator) else p4_raw
 rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
 
@@ -1080,7 +1080,7 @@ if (nnz5 == 0L) {
     present_feature_cols = head(v5_fit$features, 20L)
   ))
 }
-p5_raw <- predict(v5_fit$bst, newdata = X5, nthread = 1); rm(X5); gc(FALSE)
+p5_raw <- predict(v5_fit$bst, newdata = as.matrix(X5), nthread = 1); rm(X5); gc(FALSE)
 p5 <- if (isTRUE(use_cal)) apply_calibrator(p5_raw, v5_fit$calibrator) else p5_raw
 rm(p5_raw); if (!CACHE_MODELS) release_fit("v5"); rm(v5_fit); gc()
 

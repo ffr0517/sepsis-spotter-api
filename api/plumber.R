@@ -7,7 +7,7 @@ library(rlang)
 library(vctrs)
 
 # Control model caching for low-RAM instances
-CACHE_MODELS <- tolower(Sys.getenv("CACHE_MODELS", "true")) %in% c("1","true","t","yes","y")
+CACHE_MODELS <- tolower(Sys.getenv("CACHE_MODELS", "false")) %in% c("1","true","t","yes","y")
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 

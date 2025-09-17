@@ -9,40 +9,66 @@ BASE_URL <- Sys.getenv("SEPSIS_SPOTTER_URL", unset = "https://sepsis-spotter.onr
 # http helpers ----
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
-post_json <- function(url, payload, retries = 6, wait = 2, timeout_s = 30) {
+post_json <- function(
+    url,
+    payload,
+    retries    = 100,
+    wait       = 2,
+    timeout_s  = 60,
+    is_success = function(resp) {
+      status <- httr2::resp_status(resp)
+      status >= 200 && status < 300
+    }
+) {
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  
+  # Hard cap on retries
+  retries <- min(as.integer(retries %||% 100L), 100L)
+  
   last_err_msg <- NULL
+  transient_statuses <- c(408, 425, 429, 500, 502, 503, 504)
+  
   for (i in seq_len(retries)) {
     resp <- try({
       req <- httr2::request(url) |>
-        httr2::req_timeout(timeout_s) |>
+        httr2::req_body_json(payload, auto_unbox = TRUE) |>
         httr2::req_headers(
           "Content-Type" = "application/json",
-          "User-Agent"   = "sepsis-spotter-test/1.0"
+          "Accept"       = "application/json"
         ) |>
-        httr2::req_body_json(payload, auto_unbox = TRUE)
+        httr2::req_timeout(seconds = timeout_s) |>
+        httr2::req_retry(max_tries = 1)  # manual retry loop
       httr2::req_perform(req)
     }, silent = TRUE)
     
     if (inherits(resp, "try-error")) {
       last_err_msg <- conditionMessage(attr(resp, "condition") %||% simpleError("request failed"))
-      Sys.sleep(wait * (1.5^(i - 1)) + runif(1, 0, 0.5))
+      if (i < retries) Sys.sleep(wait)
       next
     }
     
     status <- httr2::resp_status(resp)
-    if (status %in% c(408,409,425,429) || status >= 500) {
-      message("Attempt ", i, " -> HTTP ", status, " (", httr2::resp_status_desc(resp), ")")
-      Sys.sleep(wait * (1.5^(i - 1)) + runif(1, 0, 0.5))
-      next
-    }
-    if (status >= 400) {
+    
+    # Fail immediately on non-transient 4xx/5xx
+    if (status >= 400 && !(status %in% transient_statuses)) {
       cat("Server error body:\n", httr2::resp_body_string(resp), "\n")
-      stop(sprintf("HTTP %s %s", httr2::resp_status(resp), httr2::resp_status_desc(resp)))
+      stop(sprintf("HTTP %s %s", status, httr2::resp_status_desc(resp)))
     }
-    return(httr2::resp_body_json(resp, simplifyVector = TRUE))
+    
+    # Exit immediately if response is “good”
+    if (is_success(resp)) {
+      return(httr2::resp_body_json(resp, simplifyVector = TRUE))
+    }
+    
+    # Otherwise, retry if we can
+    message("Attempt ", i, " -> HTTP ", status, " (", httr2::resp_status_desc(resp), ")")
+    if (i < retries) Sys.sleep(wait)
   }
+  
   stop("Failed after retries: ", last_err_msg %||% "unknown")
 }
+
+
 get_json <- function(url) {
   resp <- httr2::request(url) |> httr2::req_timeout(15) |> httr2::req_perform()
   if (httr2::resp_status(resp) >= 400) {
@@ -53,6 +79,37 @@ get_json <- function(url) {
 }
 
 num <- function(x) suppressWarnings(as.numeric(x))
+
+# API Warm-up Routine ----
+cat("Warming up API at", BASE_URL, "(this may take up to 5 minutes)...\n")
+max_wait_s <- 300      # 5 minutes total
+poll_interval_s <- 5   # Check every 5 seconds
+max_attempts <- max_wait_s / poll_interval_s
+api_ready <- FALSE
+
+for (i in seq_len(max_attempts)) {
+  # Gracefully handle connection errors while the server is starting
+  resp <- try(
+    httr2::request(paste0(BASE_URL, "/healthz")) |>
+      httr2::req_timeout(seconds = poll_interval_s) |>
+      httr2::req_perform(),
+    silent = TRUE
+  )
+  
+  if (!inherits(resp, "try-error") && httr2::resp_status(resp) == 200) {
+    cat("\nAPI is live!\n")
+    api_ready <- TRUE
+    break # Exit the loop on success
+  }
+  
+  cat(".") # Print a dot to show progress
+  Sys.sleep(poll_interval_s)
+}
+
+# If the loop finished without the API becoming ready, stop the script.
+if (!api_ready) {
+  stop("API did not become available after ", max_wait_s, " seconds.")
+}
 
 # health check ----
 cat("Health check @", BASE_URL, "...\n")
@@ -140,7 +197,7 @@ s2_features <- modifyList(
   )
 )
 
-# calling s2 (calibrated and raw) ----
+# calling s2 (calibrated) ----
 cat("\nCalling /s2_infer (calibrated=TRUE) ...\n")
 s2_out_cal <- post_json(paste0(BASE_URL, "/s2_infer"),
                         list(features = s2_features, apply_calibration = TRUE),
@@ -149,39 +206,248 @@ s2_out_cal <- post_json(paste0(BASE_URL, "/s2_infer"),
 cat("\nS2 (calibrated) result:\n")
 print(s2_out_cal)
 
-cat("\nCalling /s2_infer (calibrated=FALSE) ...\n")
-s2_out_raw <- post_json(paste0(BASE_URL, "/s2_infer"),
-                        list(features = s2_features, apply_calibration = FALSE),
+# S2 call in isolation with minimal inputs ----
+s2_features <- list(
+  # Core clinical anchors
+  sex        = 0,
+  age.months        = 24,
+  wfaz              = -1.2,
+  hr.all            = 118,
+  rr.all            = 30,
+  not.alert         = 1,   # 1 = not alert, 0 = alert
+  crt.long          = 0,   # 1 = prolonged CRT, 0 = normal
+  adm.recent        = 0,   # 1 = yes, 0 = no recent admission
+  
+  # Three chosen biomarkers (example values, replace with real ones)
+  CRP    = 22.5,
+  IL6    = 14.8,
+  supar  = 2.9,
+  oxy.ra = 98,
+  
+  # All other biomarkers left missing
+  ANG1       = NA_real_,
+  ANG2       = NA_real_,
+  CHI3L      = NA_real_,
+  CXCl10     = NA_real_,
+  IL1ra      = NA_real_,
+  IL8        = NA_real_,
+  IL10       = NA_real_,
+  PROC       = NA_real_,
+  TNFR1      = NA_real_,
+  STREM1     = NA_real_,
+  VEGFR1     = NA_real_,
+  lblac      = NA_real_,
+  lbglu      = NA_real_,
+  enescbchb1 = NA_real_,
+  
+  # Binary / flag-like predictors defaulted to “absent”
+  bgcombyn          = 0L,
+  waste             = 0L,
+  stunt             = 0L,
+  prior.care        = 0L,
+  travel.time.bin   = 0L,
+  diarrhoeal        = 0L,
+  pneumo            = 0L,
+  sev.pneumo        = 0L,
+  ensapro           = 0L,
+  vomit.all         = 0L,
+  seiz              = 0L,
+  pfacleth          = 0L,
+  danger.sign       = 0L,
+  parenteral_screen = 0L,
+  syndrome.resp     = 0L,
+  syndrome.nonresp  = 0L,
+  infection         = 0L,
+  
+  # Optional continuous fields left missing
+  envhtemp = NA_real_,
+  
+  # S1 meta-probs (must come from /s1_infer output above)
+  v1_pred_Severe    = v1_sev,
+  v1_pred_Other     = v1_oth,
+  v2_pred_NOTSevere = v2_not,
+  v2_pred_Other     = v2_oth,
+  
+  # Label for traceability
+  label = "demo-patient-001"
+)
+
+cat("\nCalling /s2_infer (calibrated=TRUE) ...\n")
+s2_out_cal <- post_json(paste0(BASE_URL, "/s2_infer"),
+                        list(features = s2_features, apply_calibration = TRUE),
                         timeout_s = 180)
 
-cat("\nS2 (raw) result:\n")
-print(s2_out_raw)
-cat("\n--- Summary ---\n")
-fmt_row <- function(x) {
-  if (is.character(x) && length(x) == 1L && grepl("^\\s*([\\[{])", x)) {
-    x <- jsonlite::fromJSON(x, simplifyVector = TRUE)
+cat("\nS2 (calibrated) result:\n")
+print(s2_out_cal)
+# ----
+# Function for complete api calling (TAKES 5 MINS) ----
+S2Predict <- function(
+    clinical,
+    biomarkers,
+    label        = NULL,
+    base_url     = BASE_URL,
+    calibrated   = TRUE,
+    timeout_s    = 360,
+    retries      = 100
+) {
+  # --- helpers ---------------------------------------------------------------
+  stopf <- function(...) stop(sprintf(...), call. = FALSE)
+  
+  coerce_num <- function(x, nm) {
+    if (is.null(x)) stopf("Missing required numeric field '%s'.", nm)
+    xn <- suppressWarnings(as.numeric(x))
+    if (length(xn) != 1L || is.na(xn)) stopf("Field '%s' must be a single numeric value.", nm)
+    xn
   }
   
-  if (is.data.frame(x)) {
-    x <- as.list(x[1, , drop = FALSE])
-  } else if (is.list(x) && is.null(names(x)) && length(x) >= 1L && is.list(x[[1]])) {
-    x <- x[[1]]
+  coerce_bin01 <- function(x, nm) {
+    if (is.null(x)) stopf("Missing required binary field '%s' (0/1).", nm)
+    if (is.logical(x)) return(as.integer(x))
+    if (is.numeric(x)) {
+      xi <- as.integer(round(x))
+      if (xi %in% c(0L, 1L)) return(xi)
+    }
+    if (is.character(x)) {
+      v <- tolower(trimws(x))
+      if (v %in% c("1","true","t","yes","y","m","male"))   return(1L)
+      if (v %in% c("0","false","f","no","n","female","f")) return(0L)
+    }
+    stopf("Field '%s' must be binary 0/1 (or TRUE/FALSE). Got: %s", nm, deparse(x))
   }
   
-  # Safety getters
-  gnum <- function(nm) suppressWarnings(as.numeric(if (is.null(x[[nm]])) NA_real_ else x[[nm]]))
-  gchr <- function(nm) as.character(if (is.null(x[[nm]])) "" else x[[nm]])
+  # All lab names used by S2
+  LAB_VARS <- c(
+    "ANG1","ANG2","CHI3L","CRP","CXCl10","IL1ra","IL6","IL8","IL10",
+    "PROC","TNFR1","STREM1","VEGFR1","supar","lblac","lbglu","enescbchb1"
+  )
   
-  sprintf(
-    "ID=%s | v3=%.3f (thr=%.3f) | v4=%.3f (thr=%.3f) | v5=%.3f (thr=%.3f) | bits=%s | call=%s",
-    gchr("label"),
-    gnum("p_v3"), gnum("thr_v3"),
-    gnum("p_v4"), gnum("thr_v4"),
-    gnum("p_v5"), gnum("thr_v5"),
-    gchr("bit_key"), gchr("call")
+  # Binary/flag-like clinical vars defaulting to 0 unless provided
+  BIN_DEFAULTS <- c(
+    "bgcombyn","adm.recent","waste","stunt","prior.care","travel.time.bin",
+    "diarrhoeal","pneumo","sev.pneumo","ensapro","vomit.all","seiz",
+    "pfacleth","not.alert","danger.sign","crt.long","parenteral_screen",
+    "syndrome.resp","syndrome.nonresp","infection"
+  )
+  
+  # --- validate required clinical -------------------------------------------
+  req_num <- c("age.months","wfaz","hr.all","rr.all")
+  req_bin <- c("sex","not.alert","crt.long","adm.recent")
+  
+  clinical <- as.list(clinical %||% list())
+  biomarkers <- as.list(biomarkers %||% list())
+  
+  `%or%` <- function(x, y) if (is.null(x)) y else x
+  
+  # Required numeric
+  req_num_vals <- lapply(setNames(req_num, req_num), function(nm) coerce_num(clinical[[nm]], nm))
+  # Required binary
+  req_bin_vals <- lapply(setNames(req_bin, req_bin), function(nm) coerce_bin01(clinical[[nm]], nm))
+  
+  # Optional numerics we pass through if present
+  opt_num_names <- c("oxy.ra","envhtemp","SIRS_num","cidysymp")
+  opt_num_vals <- lapply(setNames(opt_num_names, opt_num_names), function(nm) {
+    if (is.null(clinical[[nm]])) return(NA_real_)
+    suppressWarnings(as.numeric(clinical[[nm]]))
+  })
+  
+  # Default all other binary flags to 0, then overwrite with user-provided (coerced)
+  bin_map <- as.list(rep(0L, length(BIN_DEFAULTS))); names(bin_map) <- BIN_DEFAULTS
+  for (nm in BIN_DEFAULTS) {
+    if (!is.null(clinical[[nm]])) bin_map[[nm]] <- coerce_bin01(clinical[[nm]], nm)
+  }
+  
+  # Merge the *required* values back into the bin_map (ensures consistency)
+  for (nm in names(req_bin_vals)) bin_map[[nm]] <- req_bin_vals[[nm]]
+  
+  # --- biomarkers: require >= 3 real values ----------------------------------
+  labs_full <- as.list(rep(NA_real_, length(LAB_VARS))); names(labs_full) <- LAB_VARS
+  for (nm in LAB_VARS) {
+    if (!is.null(biomarkers[[nm]])) {
+      labs_full[[nm]] <- suppressWarnings(as.numeric(biomarkers[[nm]]))
+    }
+  }
+  n_labs_present <- sum(is.finite(unlist(labs_full)))
+  if (n_labs_present < 3L) {
+    have <- names(which(is.finite(unlist(labs_full))))
+    stopf("At least 3 biomarkers must have real values. Provided (%d): %s",
+          n_labs_present, paste(have, collapse = ", "))
+  }
+  
+  # --- Build S1 feature list -------------------------------------------------
+  s1_features <- c(
+    # required numeric
+    req_num_vals,
+    # required bin
+    req_bin_vals,
+    # optional numeric
+    opt_num_vals,
+    # remaining binary defaults
+    bin_map[c(
+      "bgcombyn","waste","stunt","prior.care","travel.time.bin","diarrhoeal",
+      "pneumo","sev.pneumo","ensapro","vomit.all","seiz","pfacleth",
+      "danger.sign","parenteral_screen"
+    )]
+  )
+  
+  # --- Call S1 ---------------------------------------------------------------
+  s1_out <- post_json(
+    paste0(base_url, "/s1_infer"),
+    list(features = s1_features),
+    retries   = retries,
+    timeout_s = timeout_s
+  )
+  
+  v1_sev <- suppressWarnings(as.numeric(s1_out$v1$prob))
+  v2_not <- suppressWarnings(as.numeric(s1_out$v2$prob))
+  if (length(v1_sev) != 1L || !is.finite(v1_sev)) stopf("S1 did not return a valid v1 probability.")
+  if (length(v2_not) != 1L || !is.finite(v2_not)) stopf("S1 did not return a valid v2 probability.")
+  v1_oth <- 1 - v1_sev
+  v2_oth <- 1 - v2_not
+  
+  # --- Build S2 feature list -------------------------------------------------
+  s2_features <- c(
+    # clinical: numeric
+    req_num_vals,
+    opt_num_vals,
+    # clinical: binary/flags
+    bin_map,
+    # biomarkers: given 3+ real, rest NA_real_
+    labs_full,
+    # meta-probs from S1
+    list(
+      v1_pred_Severe    = v1_sev,
+      v1_pred_Other     = v1_oth,
+      v2_pred_NOTSevere = v2_not,
+      v2_pred_Other     = v2_oth
+    ),
+    # label
+    list(label = label %or% sprintf("s2-auto-%s", as.integer(Sys.time())))
+  )
+  
+  # --- Call S2 ---------------------------------------------------------------
+  s2_out <- post_json(
+    paste0(base_url, "/s2_infer"),
+    list(features = s2_features, apply_calibration = isTRUE(calibrated)),
+    retries   = retries,
+    timeout_s = timeout_s
+  )
+  
+  list(
+    ok          = TRUE,
+    s1          = s1_out,
+    s2          = s2_out,
+    used_inputs = list(clinical = clinical, biomarkers = biomarkers),
+    payloads    = list(s1_features = s1_features, s2_features = s2_features)
   )
 }
-cat("Calibrated: ", fmt_row(s2_out_cal), "\n", sep = "")
-cat("Raw:        ", fmt_row(s2_out_raw), "\n", sep = "")
 
-cat("\nDone.\n")
+out <- S2Predict(
+  clinical = list(
+    sex=0, age.months=24, wfaz=-1.2, hr.all=118, rr.all=30,
+    not.alert=1, crt.long=0, adm.recent=0, oxy.ra=98
+  ),
+  biomarkers = list(CRP=22.5, IL6=14.8, supar=2.9),
+  label = "demo-patient-001"
+)
+
+print(out$s2)

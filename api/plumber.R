@@ -356,23 +356,24 @@ bake_once_with <- function(fit, new_data) {
   bake(fit$prep, new_data = new_data)
 }
 
-build_sparse_for <- function(baked, features) {
+build_dense_for <- function(baked, features) {
   # Ensure all expected features exist
   miss_feats <- setdiff(features, names(baked))
   if (length(miss_feats)) for (mc in miss_feats) baked[[mc]] <- 0
-  baked <- baked[, features, drop = FALSE]
 
-  # Build sparse design (names should match 'features' order)
-  fml <- as.formula(paste("~", paste(sprintf("`%s`", features), collapse = " + "), "- 1"))
-  X <- Matrix::sparse.model.matrix(fml, data = baked)
+  # Subset & coerce every column to numeric without model.matrix()
+  df <- baked[, features, drop = FALSE]
+  num_df <- as.data.frame(lapply(df, function(x) {
+    if (is.numeric(x)) return(x)
+    if (is.integer(x)) return(as.numeric(x))
+    if (is.logical(x)) return(as.numeric(x))
+    if (is.factor(x))  return(suppressWarnings(as.numeric(as.character(x))))
+    suppressWarnings(as.numeric(x))
+  }), stringsAsFactors = FALSE)
 
-  # Canonical type + log
-  X <- methods::as(X, "dgCMatrix")
-  .log(sprintf(
-    "s2_infer: build_sparse_for -> baked dims: %d x %d; need %d feats; nnz=%d",
-    nrow(baked), ncol(baked), length(features), length(X@x)
-  ))
-  X
+  mm <- as.matrix(num_df)
+  colnames(mm) <- features
+  mm
 }
 
 
@@ -860,24 +861,21 @@ function(req, res) {
 return(resp)  
 }
 
-.align_for_booster <- function(X, booster, fallback_names = NULL) {
-  # Prefer names from the booster; fall back to provided vector or colnames(X)
+.align_for_booster_matrix <- function(M, booster, fallback_names = NULL) {
   feat_obj <- booster$feature_names
-  if (is.null(feat_obj) || !length(feat_obj)) feat_obj <- fallback_names %||% colnames(X)
+  if (is.null(feat_obj) || !length(feat_obj)) feat_obj <- fallback_names %||% colnames(M)
 
-  # Check for missing/extra columns
-  missing <- setdiff(feat_obj, colnames(X))
-  extra   <- setdiff(colnames(X), feat_obj)
+  missing <- setdiff(feat_obj, colnames(M))
+  extra   <- setdiff(colnames(M), feat_obj)
   if (length(missing) || length(extra)) {
     stop(sprintf("feature_name_mismatch: missing=%s; extra=%s",
                  paste(utils::head(missing, 10), collapse=","),
                  paste(utils::head(extra, 10), collapse=",")))
   }
 
-  # Reorder to exactly match the booster’s training order
-  X <- X[, match(feat_obj, colnames(X)), drop = FALSE]
-  colnames(X) <- feat_obj
-  X
+  M <- M[, match(feat_obj, colnames(M)), drop = FALSE]
+  colnames(M) <- feat_obj
+  M
 }
 
 # ---------------------------------------------------------------------
@@ -1027,7 +1025,7 @@ if (nrow(baked_once) == 0L) {
 
 # Predict v3 using reused baked data
 .log("s2_infer: predicting v3")
-X3 <- build_sparse_for(baked_once, v3_fit$features)
+X3 <- build_dense_for(baked_once, v3_fit$features)
 if (length(X3@x) == 0L) {
   res$status <- 422
   return(list(
@@ -1038,7 +1036,7 @@ if (length(X3@x) == 0L) {
 }
 
 # align names/order to booster, then densify for predict
-X3 <- .align_for_booster(X3, v3_fit$bst, fallback_names = v3_fit$features)
+X3 <- .align_for_booster_matrix(X3, v3_fit$bst, fallback_names = v3_fit$features)
 p3_raw <- predict(v3_fit$bst, newdata = as.matrix(X3), nthread = 1)
 rm(X3); gc(FALSE)
 p3 <- if (isTRUE(use_cal)) apply_calibrator(p3_raw, v3_fit$calibrator) else p3_raw
@@ -1048,7 +1046,7 @@ rm(p3_raw); if (!CACHE_MODELS) release_fit("v3"); rm(v3_fit); gc()
 .log("s2_infer: loading v4")
 v4_fit <- get_fit("v4", V4_PATH); thr4 <- get_thr(v4_fit, v4_meta, 0.50)
 .log("s2_infer: predicting v4 (reuse baked)")
-X4 <- build_sparse_for(baked_once, v4_fit$features)
+X4 <- build_dense_for(baked_once, v4_fit$features)
 if (length(X4@x) == 0L) {
   res$status <- 422
   return(list(
@@ -1059,7 +1057,7 @@ if (length(X4@x) == 0L) {
 }
 
 # align names/order to booster, then densify for predict
-X4 <- .align_for_booster(X4, v4_fit$bst, fallback_names = v4_fit$features)
+X4 <- .align_for_booster_matrix(X4, v4_fit$bst, fallback_names = v4_fit$features)
 p4_raw <- predict(v4_fit$bst, newdata = as.matrix(X4), nthread = 1)
 rm(X4); gc(FALSE)
 p4 <- if (isTRUE(use_cal)) apply_calibrator(p4_raw, v4_fit$calibrator) else p4_raw
@@ -1069,7 +1067,7 @@ rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
 .log("s2_infer: loading v5")
 v5_fit <- get_fit("v5", V5_PATH); thr5 <- get_thr(v5_fit, v5_meta, 0.50)
 .log("s2_infer: predicting v5 (reuse baked)")
-X5 <- build_sparse_for(baked_once, v5_fit$features)
+X5 <- build_dense_for(baked_once, v5_fit$features)
 if (length(X5@x) == 0L) {
   res$status <- 522
   return(list(
@@ -1080,7 +1078,7 @@ if (length(X5@x) == 0L) {
 }
 
 # align names/order to booster, then densify for predict
-X5 <- .align_for_booster(X5, v5_fit$bst, fallback_names = v5_fit$features)
+X5 <- .align_for_booster_matrix(X5, v5_fit$bst, fallback_names = v5_fit$features)
 p5_raw <- predict(v5_fit$bst, newdata = as.matrix(X5), nthread = 1)
 rm(X5); gc(FALSE)
 p5 <- if (isTRUE(use_cal)) apply_calibrator(p5_raw, v5_fit$calibrator) else p5_raw

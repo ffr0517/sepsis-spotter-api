@@ -4,7 +4,7 @@ suppressPackageStartupMessages({
   library(jsonlite)
 })
 
-BASE_URL <- Sys.getenv("SEPSIS_SPOTTER_URL", unset = "https://sepsis-spotter.onrender.com")
+BASE_URL <- Sys.getenv("SEPSIS_SPOTTER_URL", unset = "https://sepsis-spotter-beta.onrender.com")
 
 # http helpers ----
 `%||%` <- function(x, y) if (is.null(x)) y else x
@@ -81,6 +81,7 @@ get_json <- function(url) {
 num <- function(x) suppressWarnings(as.numeric(x))
 
 # API Warm-up Routine ----
+tic()
 cat("Warming up API at", BASE_URL, "(this may take up to 5 minutes)...\n")
 max_wait_s <- 300      # 5 minutes total
 poll_interval_s <- 5   # Check every 5 seconds
@@ -110,10 +111,13 @@ for (i in seq_len(max_attempts)) {
 if (!api_ready) {
   stop("API did not become available after ", max_wait_s, " seconds.")
 }
+toc()
 
 # health check ----
+tic()
 cat("Health check @", BASE_URL, "...\n")
 print(get_json(paste0(BASE_URL, "/healthz")))
+toc()
 
 # Mock patient details (S1 clinical features only) ----
 s1_features <- list(
@@ -146,6 +150,7 @@ s1_features <- list(
 )
 
 # call s1 ----
+tic()
 cat("\nCalling /s1_infer ...\n")
 s1_out <- post_json(paste0(BASE_URL, "/s1_infer"), list(features = s1_features))
 # Extract S1 meta-probs for S2
@@ -161,6 +166,7 @@ print(list(
   s1_decision = s1_out$s1_decision,
   rule = s1_out$rule
 ))
+toc()
 
 # build S2 features = S1 clinical + biomarkers + S1 meta-probs ----
 ## NOTE: send only raw fields; the saved recipe handles NA indicators, imputation, dummies.
@@ -198,6 +204,7 @@ s2_features <- modifyList(
 )
 
 # calling s2 (calibrated) ----
+tic()
 cat("\nCalling /s2_infer (calibrated=TRUE) ...\n")
 s2_out_cal <- post_json(paste0(BASE_URL, "/s2_infer"),
                         list(features = s2_features, apply_calibration = TRUE),
@@ -205,6 +212,7 @@ s2_out_cal <- post_json(paste0(BASE_URL, "/s2_infer"),
 
 cat("\nS2 (calibrated) result:\n")
 print(s2_out_cal)
+toc()
 
 # S2 call in isolation with minimal inputs ----
 s2_features <- list(
@@ -272,6 +280,7 @@ s2_features <- list(
   label = "demo-patient-001"
 )
 
+tic()
 cat("\nCalling /s2_infer (calibrated=TRUE) ...\n")
 s2_out_cal <- post_json(paste0(BASE_URL, "/s2_infer"),
                         list(features = s2_features, apply_calibration = TRUE),
@@ -279,175 +288,4 @@ s2_out_cal <- post_json(paste0(BASE_URL, "/s2_infer"),
 
 cat("\nS2 (calibrated) result:\n")
 print(s2_out_cal)
-# ----
-# Function for complete api calling (TAKES 5 MINS) ----
-S2Predict <- function(
-    clinical,
-    biomarkers,
-    label        = NULL,
-    base_url     = BASE_URL,
-    calibrated   = TRUE,
-    timeout_s    = 360,
-    retries      = 100
-) {
-  # --- helpers ---------------------------------------------------------------
-  stopf <- function(...) stop(sprintf(...), call. = FALSE)
-  
-  coerce_num <- function(x, nm) {
-    if (is.null(x)) stopf("Missing required numeric field '%s'.", nm)
-    xn <- suppressWarnings(as.numeric(x))
-    if (length(xn) != 1L || is.na(xn)) stopf("Field '%s' must be a single numeric value.", nm)
-    xn
-  }
-  
-  coerce_bin01 <- function(x, nm) {
-    if (is.null(x)) stopf("Missing required binary field '%s' (0/1).", nm)
-    if (is.logical(x)) return(as.integer(x))
-    if (is.numeric(x)) {
-      xi <- as.integer(round(x))
-      if (xi %in% c(0L, 1L)) return(xi)
-    }
-    if (is.character(x)) {
-      v <- tolower(trimws(x))
-      if (v %in% c("1","true","t","yes","y","m","male"))   return(1L)
-      if (v %in% c("0","false","f","no","n","female","f")) return(0L)
-    }
-    stopf("Field '%s' must be binary 0/1 (or TRUE/FALSE). Got: %s", nm, deparse(x))
-  }
-  
-  # All lab names used by S2
-  LAB_VARS <- c(
-    "ANG1","ANG2","CHI3L","CRP","CXCl10","IL1ra","IL6","IL8","IL10",
-    "PROC","TNFR1","STREM1","VEGFR1","supar","lblac","lbglu","enescbchb1"
-  )
-  
-  # Binary/flag-like clinical vars defaulting to 0 unless provided
-  BIN_DEFAULTS <- c(
-    "bgcombyn","adm.recent","waste","stunt","prior.care","travel.time.bin",
-    "diarrhoeal","pneumo","sev.pneumo","ensapro","vomit.all","seiz",
-    "pfacleth","not.alert","danger.sign","crt.long","parenteral_screen",
-    "syndrome.resp","syndrome.nonresp","infection"
-  )
-  
-  # --- validate required clinical -------------------------------------------
-  req_num <- c("age.months","wfaz","hr.all","rr.all")
-  req_bin <- c("sex","not.alert","crt.long","adm.recent")
-  
-  clinical <- as.list(clinical %||% list())
-  biomarkers <- as.list(biomarkers %||% list())
-  
-  `%or%` <- function(x, y) if (is.null(x)) y else x
-  
-  # Required numeric
-  req_num_vals <- lapply(setNames(req_num, req_num), function(nm) coerce_num(clinical[[nm]], nm))
-  # Required binary
-  req_bin_vals <- lapply(setNames(req_bin, req_bin), function(nm) coerce_bin01(clinical[[nm]], nm))
-  
-  # Optional numerics we pass through if present
-  opt_num_names <- c("oxy.ra","envhtemp","SIRS_num","cidysymp")
-  opt_num_vals <- lapply(setNames(opt_num_names, opt_num_names), function(nm) {
-    if (is.null(clinical[[nm]])) return(NA_real_)
-    suppressWarnings(as.numeric(clinical[[nm]]))
-  })
-  
-  # Default all other binary flags to 0, then overwrite with user-provided (coerced)
-  bin_map <- as.list(rep(0L, length(BIN_DEFAULTS))); names(bin_map) <- BIN_DEFAULTS
-  for (nm in BIN_DEFAULTS) {
-    if (!is.null(clinical[[nm]])) bin_map[[nm]] <- coerce_bin01(clinical[[nm]], nm)
-  }
-  
-  # Merge the *required* values back into the bin_map (ensures consistency)
-  for (nm in names(req_bin_vals)) bin_map[[nm]] <- req_bin_vals[[nm]]
-  
-  # --- biomarkers: require >= 3 real values ----------------------------------
-  labs_full <- as.list(rep(NA_real_, length(LAB_VARS))); names(labs_full) <- LAB_VARS
-  for (nm in LAB_VARS) {
-    if (!is.null(biomarkers[[nm]])) {
-      labs_full[[nm]] <- suppressWarnings(as.numeric(biomarkers[[nm]]))
-    }
-  }
-  n_labs_present <- sum(is.finite(unlist(labs_full)))
-  if (n_labs_present < 3L) {
-    have <- names(which(is.finite(unlist(labs_full))))
-    stopf("At least 3 biomarkers must have real values. Provided (%d): %s",
-          n_labs_present, paste(have, collapse = ", "))
-  }
-  
-  # --- Build S1 feature list -------------------------------------------------
-  s1_features <- c(
-    # required numeric
-    req_num_vals,
-    # required bin
-    req_bin_vals,
-    # optional numeric
-    opt_num_vals,
-    # remaining binary defaults
-    bin_map[c(
-      "bgcombyn","waste","stunt","prior.care","travel.time.bin","diarrhoeal",
-      "pneumo","sev.pneumo","ensapro","vomit.all","seiz","pfacleth",
-      "danger.sign","parenteral_screen"
-    )]
-  )
-  
-  # --- Call S1 ---------------------------------------------------------------
-  s1_out <- post_json(
-    paste0(base_url, "/s1_infer"),
-    list(features = s1_features),
-    retries   = retries,
-    timeout_s = timeout_s
-  )
-  
-  v1_sev <- suppressWarnings(as.numeric(s1_out$v1$prob))
-  v2_not <- suppressWarnings(as.numeric(s1_out$v2$prob))
-  if (length(v1_sev) != 1L || !is.finite(v1_sev)) stopf("S1 did not return a valid v1 probability.")
-  if (length(v2_not) != 1L || !is.finite(v2_not)) stopf("S1 did not return a valid v2 probability.")
-  v1_oth <- 1 - v1_sev
-  v2_oth <- 1 - v2_not
-  
-  # --- Build S2 feature list -------------------------------------------------
-  s2_features <- c(
-    # clinical: numeric
-    req_num_vals,
-    opt_num_vals,
-    # clinical: binary/flags
-    bin_map,
-    # biomarkers: given 3+ real, rest NA_real_
-    labs_full,
-    # meta-probs from S1
-    list(
-      v1_pred_Severe    = v1_sev,
-      v1_pred_Other     = v1_oth,
-      v2_pred_NOTSevere = v2_not,
-      v2_pred_Other     = v2_oth
-    ),
-    # label
-    list(label = label %or% sprintf("s2-auto-%s", as.integer(Sys.time())))
-  )
-  
-  # --- Call S2 ---------------------------------------------------------------
-  s2_out <- post_json(
-    paste0(base_url, "/s2_infer"),
-    list(features = s2_features, apply_calibration = isTRUE(calibrated)),
-    retries   = retries,
-    timeout_s = timeout_s
-  )
-  
-  list(
-    ok          = TRUE,
-    s1          = s1_out,
-    s2          = s2_out,
-    used_inputs = list(clinical = clinical, biomarkers = biomarkers),
-    payloads    = list(s1_features = s1_features, s2_features = s2_features)
-  )
-}
-
-out <- S2Predict(
-  clinical = list(
-    sex=0, age.months=24, wfaz=-1.2, hr.all=118, rr.all=30,
-    not.alert=1, crt.long=0, adm.recent=0, oxy.ra=98
-  ),
-  biomarkers = list(CRP=22.5, IL6=14.8, supar=2.9),
-  label = "demo-patient-001"
-)
-
-print(out$s2)
+toc()

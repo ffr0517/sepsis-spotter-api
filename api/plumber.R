@@ -60,6 +60,17 @@ release_fit <- function(key) {
 
 is_loaded <- function(key) exists(key, envir = .load_env, inherits = FALSE)
 
+# Meta lazy loader
+.meta_env <- new.env(parent = emptyenv())
+get_meta <- function(key, path) {
+  if (exists(key, envir = .meta_env, inherits = FALSE)) {
+    return(get(key, envir = .meta_env, inherits = FALSE))
+  }
+  obj <- readRDS(path)
+  assign(key, obj, envir = .meta_env)
+  obj
+}
+
 # Model paths
 V1_PATH <- "models/v1_model.rds"
 V2_PATH <- "models/v2_model.rds"
@@ -67,11 +78,11 @@ V3_PATH <- "models/v3_model.rds"
 V4_PATH <- "models/v4_model.rds"
 V5_PATH <- "models/v5_model.rds"
 
-v1_meta <- readRDS("models/v1_meta.rds")
-v2_meta <- readRDS("models/v2_meta.rds")
-v3_meta <- readRDS("models/v3_meta.rds")
-v4_meta <- readRDS("models/v4_meta.rds")
-v5_meta <- readRDS("models/v5_meta.rds")
+v1_meta <- get_meta("v1_meta", "models/v1_meta.rds")
+v2_meta <- get_meta("v2_meta", "models/v2_meta.rds")
+v3_meta <- get_meta("v3_meta", "models/v3_meta.rds")
+v4_meta <- get_meta("v4_meta", "models/v4_meta.rds")
+v5_meta <- get_meta("v5_meta", "models/v5_meta.rds")
 
 # ---------------------------------------------------------------------
 # Defaults / knobs (used if meta doesn't define them)
@@ -699,6 +710,13 @@ function() {
     models_loaded = list(v3 = is_loaded("v3"), v4 = is_loaded("v4"), v5 = is_loaded("v5")),
     mem = as.list(gc()[, c("used","gc trigger","max used")])
   )
+}
+
+#* @post /admin/release_all
+function() {
+  for (k in c("v1","v2","v3","v4","v5")) release_fit(k)
+  invisible(gc())
+  list(ok = TRUE, released = c("v1","v2","v3","v4","v5"))
 }
 
 # ---------------------------------------------------------------------

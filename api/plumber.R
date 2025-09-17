@@ -682,7 +682,6 @@ function(req, res) {
 
 #* @post /s2_warmup
 function(req, res) {
-  limit_threads()
   if (!CACHE_MODELS) {
     .log("S2 warmup skipped (CACHE_MODELS=FALSE).")
     return(list(ok = TRUE, warmed = character()))
@@ -877,7 +876,6 @@ return(resp)
 # ---------------------------------------------------------------------
 #* @post /s2_infer
 function(req, res) {
-  limit_threads()
   .log("s2_infer: start")
 
   # ---- helper: load -> predict -> free (point B) --------------------

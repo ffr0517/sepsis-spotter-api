@@ -360,17 +360,31 @@ build_sparse_for <- function(baked, features) {
   miss_feats <- setdiff(features, names(baked))
   if (length(miss_feats)) for (mc in miss_feats) baked[[mc]] <- 0
   baked <- baked[, features, drop = FALSE]
+
   fml <- as.formula(paste("~", paste(sprintf("`%s`", features), collapse = " + "), "- 1"))
   X <- Matrix::sparse.model.matrix(fml, data = baked)
+
+  # Fallback if design ended up empty (no columns)
   if (is.null(dim(X)) || ncol(X) == 0L) {
     .log("s2_infer: sparse matrix had 0 cols; injecting bias col")
-    X <- Matrix::Matrix(0, nrow = nrow(baked), ncol = 1, sparse = TRUE)
-    colnames(X) <- ".bias0"
+    X <- Matrix::Matrix(1, nrow = nrow(baked), ncol = 1, sparse = TRUE)
+    colnames(X) <- ".bias1"
+    return(X)
   }
-  .log(sprintf("s2_infer: build_sparse_for -> baked dims: %d x %d; need %d feats",
-             nrow(baked), ncol(baked), length(features)))
+
+  # NEW: guard against all-zero matrix (nnz == 0)
+  nnz <- if (inherits(X, "dgCMatrix")) length(X@x) else sum(X != 0)
+  if (nnz == 0L) {
+    .log("s2_infer: sparse matrix nnz=0; injecting bias col")
+    X <- Matrix::Matrix(1, nrow = nrow(baked), ncol = 1, sparse = TRUE)
+    colnames(X) <- ".bias1"
+  }
+
+  .log(sprintf("s2_infer: build_sparse_for -> baked dims: %d x %d; need %d feats; nnz=%d",
+               nrow(baked), ncol(baked), length(features), if (inherits(X, "dgCMatrix")) length(X@x) else sum(X != 0)))
   X
 }
+
 
 predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {
   stopifnot(!is.null(fit$prep), !is.null(fit$bst))

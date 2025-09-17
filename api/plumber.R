@@ -876,23 +876,78 @@ return(resp)
 # ---------------------------------------------------------------------
 #* @post /s2_infer
 function(req, res) {
-  .log("s2_infer: start (memory-efficient mode v2)")
+  .log("s2_infer: start")
+
+  # ---- helper: load -> predict -> free (point B) --------------------
+  score_one_version <- function(key, path, meta_obj, new_data, calibrated, res) {
+    .log("s2_infer: loading ", key)
+    fit <- get_fit(key, path)                  # cache-aware loader
+    thr <- get_thr(fit, meta_obj, 0.50)
+
+    .log("s2_infer: predicting ", key)
+    p <- try(predict_s2_probs(fit, new_data, calibrated = calibrated), silent = TRUE)
+
+    # Drop the booster + prep immediately, then GC; optionally release cache
+    rm(fit); gc(verbose = FALSE)
+    if (!CACHE_MODELS) release_fit(key)
+    gc(FALSE); gc(TRUE)
+
+    if (inherits(p, "try-error")) {
+      res$status <- 400
+      .log("s2_infer: ", key, " prediction failed -> ", substr(as.character(p), 1, 240))
+      return(list(failed = TRUE,
+                  payload = list(error = paste(key, "prediction failed"),
+                                 message = as.character(p))))
+    }
+    list(failed = FALSE, thr = thr, p = p)
+  }
 
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
   feats_in <- tryCatch(
     tibble::as_tibble_row(body$features),
     error = function(e) as.data.frame(body$features, stringsAsFactors = FALSE)
-  )
+    )
   if (!nrow(feats_in)) feats_in <- feats_in[NA, , drop = FALSE]
   if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
 
-  # ----------------- RE-INTEGRATED PADDING BLOCK (FROM ORIGINAL CODE) ----------------- #
+  on.exit({
+    if (!CACHE_MODELS) { release_fit("v3"); release_fit("v4"); release_fit("v5") }
+    invisible(gc())
+  }, add = TRUE)
+
+  # ---------- schema padding (critical) ----------
   n <- nrow(feats_in)
+
+  # Ensure training-remembered basics
   add_if_missing <- function(df, nm, val) { if (!nm %in% names(df)) df[[nm]] <- val; df }
   feats_in <- add_if_missing(feats_in, "w_final", rep(1, n))
   feats_in <- add_if_missing(feats_in, ".case_w", rep(1, n))
 
+    LAB_VARS <- c("ANG1","ANG2","CHI3L","CRP","CXCl10","IL1ra","IL6","IL8","IL10",
+                "PROC","TNFR1","STREM1","VEGFR1","supar","lblac","lbglu","enescbchb1")
+
+  labs_present <- intersect(LAB_VARS, names(feats_in))
+  have_labs_n <- if (length(labs_present)) sum(!is.na(unlist(feats_in[, labs_present, drop = FALSE]))) else 0L
+
+  # Robust checks even if columns are missing entirely
+  na_oxy  <- (!"oxy.ra"   %in% names(feats_in))  || isTRUE(is.na(feats_in$oxy.ra[1]))
+  na_sirs <- (!"SIRS_num" %in% names(feats_in)) || isTRUE(is.na(feats_in$SIRS_num[1]))
+  na_both_oxy_sirs <- na_oxy && na_sirs
+
+  allow_heavy_impute <- isTRUE(body$allow_heavy_impute)
+
+  if (!allow_heavy_impute && have_labs_n < 1 && na_both_oxy_sirs) {
+    res$status <- 422
+    .log("s2_infer: aborted early (too sparse: no labs + oxy/SIRS missing)")
+    return(list(
+      error = "S2 requires more signal",
+      reason = "no_labs_and_no_oxy_or_SIRS",
+      needed = list(any_lab = LAB_VARS, or = c("oxy.ra", "SIRS_num"))
+    ))
+  }
+
+  # Outcomes remembered by the recipe; give factor levels to be safe
   lvl_sev  <- c("Other","Severe")
   lvl_psev <- c("Other","Probable Severe")
   lvl_pns  <- c("Other","Probable Non-Severe")
@@ -903,8 +958,11 @@ function(req, res) {
   if (!"SFI_bin_probNS_vs_other" %in% names(feats_in))
     feats_in$SFI_bin_probNS_vs_other  <- factor(rep("Other", n), levels = lvl_pns)
 
+  # >>> PLACE THE NEW STUB LOOP HERE <<<
+  # Stub any remembered training columns the recipe references
   for (nm in S2_REQUIRED_STUB_COLS) {
     if (!nm %in% names(feats_in)) {
+      # type doesn't matter; step_rm() will drop them
       feats_in[[nm]] <- NA_real_
     }
   }
@@ -916,62 +974,123 @@ function(req, res) {
     if (!is.factor(feats_in[[nm]])) feats_in[[nm]] <- factor(feats_in[[nm]])
   }
 
+  # 2b) Pad ALL model predictors so downstream casting doesn’t fail
   miss_pred <- setdiff(S2_PREDICTORS, names(feats_in))
   if (length(miss_pred)) for (nm in miss_pred) feats_in[[nm]] <- NA
-  # -------------------------------- END PADDING BLOCK --------------------------------- #
 
-  run_model_cycle <- function(version, path, meta) {
-    .log(sprintf("s2_infer: processing %s", version))
-    
-    fit <- get_fit(version, path)
-    # The 'feats_in' object now has the correct schema thanks to the block above
-    baked <- bake_once_with(fit, feats_in) 
-    X <- build_dense_for(baked, fit$features)
-    
-    if (all(X == 0)) {
-      stop(sprintf("all_zero_feature_vector_for_%s", version))
-    }
-    
-    X_aligned <- .align_for_booster_matrix(X, fit$bst, fallback_names = fit$features)
-    p_raw <- predict(fit$bst, newdata = X_aligned)
-    p_final <- if (isTRUE(use_cal)) apply_calibrator(p_raw, fit$calibrator) else p_raw
-    thr <- get_thr(fit, meta, 0.50)
-    
-    rm(fit, baked, X, X_aligned, p_raw)
-    if (!CACHE_MODELS) release_fit(version)
-    gc(verbose = FALSE)
-    
-    list(p = p_final, thr = thr)
-  }
+  # ---------- v3 load (for baking) ----------
+.log("s2_infer: loading v3 (baseline bake)")
+v3_fit <- get_fit("v3", V3_PATH)  # keep object to bake
+thr3   <- get_thr(v3_fit, v3_meta, 0.50)
 
-  results <- tryCatch({
-    v3_results <- run_model_cycle("v3", V3_PATH, v3_meta)
-    v4_results <- run_model_cycle("v4", V4_PATH, v4_meta)
-    v5_results <- run_model_cycle("v5", V5_PATH, v5_meta)
-    list(v3 = v3_results, v4 = v4_results, v5 = v5_results)
-  }, error = function(e) {
-    .log("s2_infer: encountered an error during prediction cycle -> ", conditionMessage(e))
-    if (grepl("all_zero_feature_vector", conditionMessage(e), fixed = TRUE)) {
-      res$status <- 422
-      return(list(
-        error = "all_zero_feature_vector",
-        note = "After recipe and alignment, the feature vector had no non-zero entries.",
-        source_error = conditionMessage(e)
-      ))
-    }
-    res$status <- 500
-    return(list(error = "internal_server_error", message = conditionMessage(e)))
-  })
-  
-  if ("error" %in% names(results)) {
-    return(results)
-  }
+# Bake ONCE with v3 recipe (covers indicate_na, bagged impute, dummies, etc.)
+.log("s2_infer: baking once via v3 recipe")
+baked_once <- bake_once_with(v3_fit, feats_in)
 
+# DEBUG STEP (TEMPORARY)
+.log("DEBUG START: Feature Name Comparison for v3")
+baked_names <- names(baked_once)
+expected_names <- v3_fit$features
+in_both <- intersect(baked_names, expected_names)
+only_in_baked <- setdiff(baked_names, expected_names)
+only_in_expected <- setdiff(expected_names, baked_names)
+
+.log("DEBUG: Features present in BOTH (first 10): ", paste(head(in_both, 10), collapse=", "))
+.log("DEBUG: Features ONLY in recipe output (first 10): ", paste(head(only_in_baked, 10), collapse=", "))
+.log("DEBUG: Features ONLY in model's list (first 10): ", paste(head(only_in_expected, 10), collapse=", "))
+.log("DEBUG END: Feature Name Comparison for v3")
+
+# Which meta-probs does v3 actually use?
+meta_in_v3 <- intersect(v3_fit$features,
+                        c("v1_pred_Severe","v1_pred_Other","v2_pred_NOTSevere","v2_pred_Other"))
+.log(paste("s2_infer: v3 uses meta probs ->", paste(meta_in_v3, collapse=", ")))
+
+# Do we have a 1 in the not.alert dummy?
+.log(paste("s2_infer: has not.alert_X1 in baked:", "not.alert_X1" %in% names(baked_once)))
+if ("not.alert_X1" %in% names(baked_once)) {
+  .log(paste("s2_infer: not.alert_X1 value =", baked_once$not.alert_X1[1]))
+}
+
+# Sanity check after bake
+.log(sprintf("s2_infer: nrow feats_in=%s, nrow baked=%s, ncol baked=%s",
+             nrow(feats_in), nrow(baked_once), ncol(baked_once)))
+
+if (nrow(baked_once) == 0L) {
+  res$status <- 400
+  return(list(
+    error = "empty_baked_frame",
+    note  = "Recipe returned 0 rows; cannot score.",
+    nrow_feats_in   = nrow(feats_in),
+    names_in_request = names(feats_in),
+    ncol_baked      = ncol(baked_once),
+    baked_colnames  = names(baked_once),
+    need_features   = head(v3_fit$features, 20L)
+  ))
+}
+
+# Predict v3 using reused baked data
+.log("s2_infer: predicting v3")
+X3 <- build_dense_for(baked_once, v3_fit$features)
+if (all(X3 == 0)) {
+  res$status <- 422
+  return(list(
+    error = "all_zero_feature_vector",
+    note  = "After recipe + alignment to v3 features, no non-zero entries.",
+    hint  = "Provide at least one non-zero predictor used by v3 (a lab, a meta-prob, or a binary=1 flag that maps to a v3 dummy)."
+  ))
+}
+
+# align names/order to booster, then densify for predict
+X3 <- .align_for_booster_matrix(X3, v3_fit$bst, fallback_names = v3_fit$features)
+p3_raw <- predict(v3_fit$bst, newdata = as.matrix(X3), nthread = 1)
+rm(X3); gc(FALSE)
+p3 <- if (isTRUE(use_cal)) apply_calibrator(p3_raw, v3_fit$calibrator) else p3_raw
+rm(p3_raw); if (!CACHE_MODELS) release_fit("v3"); rm(v3_fit); gc()
+
+# ---------- v4 ----------
+.log("s2_infer: loading v4")
+v4_fit <- get_fit("v4", V4_PATH); thr4 <- get_thr(v4_fit, v4_meta, 0.50)
+.log("s2_infer: predicting v4 (reuse baked)")
+X4 <- build_dense_for(baked_once, v4_fit$features)
+if (all(X4 == 0)) {
+  res$status <- 422
+  return(list(
+    error = "all_zero_feature_vector",
+    note  = "After recipe + alignment to v4 features, no non-zero entries.",
+    hint  = "Provide at least one non-zero predictor used by v4 (a lab, a meta-prob, or a binary=1 flag that maps to a v3 dummy)."
+  ))
+}
+
+# align names/order to booster, then densify for predict
+X4 <- .align_for_booster_matrix(X4, v4_fit$bst, fallback_names = v4_fit$features)
+p4_raw <- predict(v4_fit$bst, newdata = as.matrix(X4), nthread = 1)
+rm(X4); gc(FALSE)
+p4 <- if (isTRUE(use_cal)) apply_calibrator(p4_raw, v4_fit$calibrator) else p4_raw
+rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
+
+# ---------- v5 ----------
+.log("s2_infer: loading v5")
+v5_fit <- get_fit("v5", V5_PATH); thr5 <- get_thr(v5_fit, v5_meta, 0.50)
+.log("s2_infer: predicting v5 (reuse baked)")
+X5 <- build_dense_for(baked_once, v5_fit$features)
+if (all(X5 == 0)) {
+  res$status <- 522
+  return(list(
+    error = "all_zero_feature_vector",
+    note  = "After recipe + alignment to v5 features, no non-zero entries.",
+    hint  = "Provide at least one non-zero predictor used by v5 (a lab, a meta-prob, or a binary=1 flag that maps to a v3 dummy)."
+  ))
+}
+
+# align names/order to booster, then densify for predict
+X5 <- .align_for_booster_matrix(X5, v5_fit$bst, fallback_names = v5_fit$features)
+p5_raw <- predict(v5_fit$bst, newdata = as.matrix(X5), nthread = 1)
+rm(X5); gc(FALSE)
+p5 <- if (isTRUE(use_cal)) apply_calibrator(p5_raw, v5_fit$calibrator) else p5_raw
+rm(p5_raw); if (!CACHE_MODELS) release_fit("v5"); rm(v5_fit); gc()
+
+  # ---------- routing ----------
   .log("s2_infer: routing results")
-  p3 <- results$v3$p; thr3 <- results$v3$thr
-  p4 <- results$v4$p; thr4 <- results$v4$thr
-  p5 <- results$v5$p; thr5 <- results$v5$thr
-  
   call <- route_s2(p3, p4, p5, thr3, thr4, thr5)
   f3 <- as.integer(p3 >= thr3); f4 <- as.integer(p4 >= thr4); f5 <- as.integer(p5 >= thr5)
   bit_key <- paste0(f3, f4, f5)
@@ -986,6 +1105,7 @@ function(req, res) {
   )
 
   .log("s2_infer: finished")
+  jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
   return(resp)
 }
 

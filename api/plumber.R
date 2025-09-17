@@ -357,31 +357,21 @@ bake_once_with <- function(fit, new_data) {
 }
 
 build_sparse_for <- function(baked, features) {
+  # Ensure all expected features exist
   miss_feats <- setdiff(features, names(baked))
   if (length(miss_feats)) for (mc in miss_feats) baked[[mc]] <- 0
   baked <- baked[, features, drop = FALSE]
 
+  # Build sparse design (names should match 'features' order)
   fml <- as.formula(paste("~", paste(sprintf("`%s`", features), collapse = " + "), "- 1"))
   X <- Matrix::sparse.model.matrix(fml, data = baked)
 
-  # Fallback if design ended up empty (no columns)
-  if (is.null(dim(X)) || ncol(X) == 0L) {
-    .log("s2_infer: sparse matrix had 0 cols; injecting bias col")
-    X <- Matrix::Matrix(1, nrow = nrow(baked), ncol = 1, sparse = TRUE)
-    colnames(X) <- ".bias1"
-    return(X)
-  }
-
-  # NEW: guard against all-zero matrix (nnz == 0)
-  nnz <- if (inherits(X, "dgCMatrix")) length(X@x) else sum(X != 0)
-  if (nnz == 0L) {
-    .log("s2_infer: sparse matrix nnz=0; injecting bias col")
-    X <- Matrix::Matrix(1, nrow = nrow(baked), ncol = 1, sparse = TRUE)
-    colnames(X) <- ".bias1"
-  }
-
-  .log(sprintf("s2_infer: build_sparse_for -> baked dims: %d x %d; need %d feats; nnz=%d",
-               nrow(baked), ncol(baked), length(features), if (inherits(X, "dgCMatrix")) length(X@x) else sum(X != 0)))
+  # Canonical type + log
+  X <- methods::as(X, "dgCMatrix")
+  .log(sprintf(
+    "s2_infer: build_sparse_for -> baked dims: %d x %d; need %d feats; nnz=%d",
+    nrow(baked), ncol(baked), length(features), length(X@x)
+  ))
   X
 }
 
@@ -870,6 +860,26 @@ function(req, res) {
 return(resp)  
 }
 
+.align_for_booster <- function(X, booster, fallback_names = NULL) {
+  # Prefer names from the booster; fall back to provided vector or colnames(X)
+  feat_obj <- booster$feature_names
+  if (is.null(feat_obj) || !length(feat_obj)) feat_obj <- fallback_names %||% colnames(X)
+
+  # Check for missing/extra columns
+  missing <- setdiff(feat_obj, colnames(X))
+  extra   <- setdiff(colnames(X), feat_obj)
+  if (length(missing) || length(extra)) {
+    stop(sprintf("feature_name_mismatch: missing=%s; extra=%s",
+                 paste(utils::head(missing, 10), collapse=","),
+                 paste(utils::head(extra, 10), collapse=",")))
+  }
+
+  # Reorder to exactly match the booster’s training order
+  X <- X[, match(feat_obj, colnames(X)), drop = FALSE]
+  colnames(X) <- feat_obj
+  X
+}
+
 # ---------------------------------------------------------------------
 # S2 inference (v3/v4/v5 -> 4-class with margin-normalised tie-breaks)
 # ---------------------------------------------------------------------
@@ -1018,24 +1028,20 @@ if (nrow(baked_once) == 0L) {
 # Predict v3 using reused baked data
 .log("s2_infer: predicting v3")
 X3 <- build_sparse_for(baked_once, v3_fit$features)
-nnz3 <- if (inherits(X3, "dgCMatrix")) length(X3@x) else sum(X3 != 0)
-if (nnz3 == 0L) {
+if (length(X3@x) == 0L) {
   res$status <- 422
   return(list(
     error = "all_zero_feature_vector",
-    note  = "After recipe and alignment to v3 features, this row has no non-zero entries; model cannot score.",
-    suggest = list(
-      set_any_of_binary_flags_to_1 = c("not.alert","danger.sign","pneumo","ensapro","vomit.all"),
-      include_any_lab_with_value   = c("CRP","IL6","supar","ANG1","..."),
-      or_include_meta_probs        = c("v1_pred_Severe","v2_pred_NOTSevere")
-    ),
-    present_feature_cols = head(v3_fit$features, 20L)
+    note  = "After recipe + alignment to v3 features, no non-zero entries.",
+    hint  = "Provide at least one non-zero predictor used by v3 (a lab, a meta-prob, or a binary=1 flag that maps to a v3 dummy)."
   ))
 }
-p3_raw <- predict(v3_fit$bst, newdata = as.matrix(X3), nthread = 1); rm(X3); gc(FALSE)
-p3 <- if (isTRUE(use_cal)) apply_calibrator(p3_raw, v3_fit$calibrator) else p3_raw
 
-# Free v3 if not caching
+# align names/order to booster, then densify for predict
+X3 <- .align_for_booster(X3, v3_fit$bst, fallback_names = v3_fit$features)
+p3_raw <- predict(v3_fit$bst, newdata = as.matrix(X3), nthread = 1)
+rm(X3); gc(FALSE)
+p3 <- if (isTRUE(use_cal)) apply_calibrator(p3_raw, v3_fit$calibrator) else p3_raw
 rm(p3_raw); if (!CACHE_MODELS) release_fit("v3"); rm(v3_fit); gc()
 
 # ---------- v4 ----------
@@ -1043,21 +1049,19 @@ rm(p3_raw); if (!CACHE_MODELS) release_fit("v3"); rm(v3_fit); gc()
 v4_fit <- get_fit("v4", V4_PATH); thr4 <- get_thr(v4_fit, v4_meta, 0.50)
 .log("s2_infer: predicting v4 (reuse baked)")
 X4 <- build_sparse_for(baked_once, v4_fit$features)
-nnz4 <- if (inherits(X4, "dgCMatrix")) length(X4@x) else sum(X4 != 0)
-if (nnz4 == 0L) {
+if (length(X4@x) == 0L) {
   res$status <- 422
   return(list(
     error = "all_zero_feature_vector",
-    note  = "After recipe and alignment to v4 features, this row has no non-zero entries; model cannot score.",
-    suggest = list(
-      set_any_of_binary_flags_to_1 = c("not.alert","danger.sign","pneumo","ensapro","vomit.all"),
-      include_any_lab_with_value   = c("CRP","IL6","supar","ANG1","..."),
-      or_include_meta_probs        = c("v1_pred_Severe","v2_pred_NOTSevere")
-    ),
-    present_feature_cols = head(v4_fit$features, 20L)
+    note  = "After recipe + alignment to v4 features, no non-zero entries.",
+    hint  = "Provide at least one non-zero predictor used by v4 (a lab, a meta-prob, or a binary=1 flag that maps to a v3 dummy)."
   ))
 }
-p4_raw <- predict(v4_fit$bst, newdata = as.matrix(X4), nthread = 1); rm(X4); gc(FALSE)
+
+# align names/order to booster, then densify for predict
+X4 <- .align_for_booster(X4, v4_fit$bst, fallback_names = v4_fit$features)
+p4_raw <- predict(v4_fit$bst, newdata = as.matrix(X4), nthread = 1)
+rm(X4); gc(FALSE)
 p4 <- if (isTRUE(use_cal)) apply_calibrator(p4_raw, v4_fit$calibrator) else p4_raw
 rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
 
@@ -1066,21 +1070,19 @@ rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
 v5_fit <- get_fit("v5", V5_PATH); thr5 <- get_thr(v5_fit, v5_meta, 0.50)
 .log("s2_infer: predicting v5 (reuse baked)")
 X5 <- build_sparse_for(baked_once, v5_fit$features)
-nnz5 <- if (inherits(X5, "dgCMatrix")) length(X5@x) else sum(X5 != 0)
-if (nnz5 == 0L) {
-  res$status <- 422
+if (length(X5@x) == 0L) {
+  res$status <- 522
   return(list(
     error = "all_zero_feature_vector",
-    note  = "After recipe and alignment to v5 features, this row has no non-zero entries; model cannot score.",
-    suggest = list(
-      set_any_of_binary_flags_to_1 = c("not.alert","danger.sign","pneumo","ensapro","vomit.all"),
-      include_any_lab_with_value   = c("CRP","IL6","supar","ANG1","..."),
-      or_include_meta_probs        = c("v1_pred_Severe","v2_pred_NOTSevere")
-    ),
-    present_feature_cols = head(v5_fit$features, 20L)
+    note  = "After recipe + alignment to v5 features, no non-zero entries.",
+    hint  = "Provide at least one non-zero predictor used by v5 (a lab, a meta-prob, or a binary=1 flag that maps to a v3 dummy)."
   ))
 }
-p5_raw <- predict(v5_fit$bst, newdata = as.matrix(X5), nthread = 1); rm(X5); gc(FALSE)
+
+# align names/order to booster, then densify for predict
+X5 <- .align_for_booster(X5, v5_fit$bst, fallback_names = v5_fit$features)
+p5_raw <- predict(v5_fit$bst, newdata = as.matrix(X5), nthread = 1)
+rm(X5); gc(FALSE)
 p5 <- if (isTRUE(use_cal)) apply_calibrator(p5_raw, v5_fit$calibrator) else p5_raw
 rm(p5_raw); if (!CACHE_MODELS) release_fit("v5"); rm(v5_fit); gc()
 

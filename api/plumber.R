@@ -237,16 +237,54 @@ cast_to_ptypes <- function(df, ptypes) {
     for (nm in miss) df[[nm]] <- vctrs::vec_init(ptypes[[nm]], n)
   }
 
-  # Helper to normalize many binary encodings to "0"/"1"
+  # Normalize many binary encodings to "0"/"1"
   to_bin_char <- function(x) {
     if (is.factor(x)) x <- as.character(x)
     if (is.logical(x)) return(ifelse(isTRUE(x), "1", "0"))
     x <- trimws(tolower(as.character(x)))
     ifelse(x %in% c("1","true","t","yes","y","m","male"), "1",
-      ifelse(x %in% c("0","false","f","no","n","female","fem"), "0", x))
+           ifelse(x %in% c("0","false","f","no","n","female","fem"), "0", x))
   }
 
   # Cast existing to prototype classes
+  for (nm in names(ptypes)) {
+    proto <- ptypes[[nm]]
+    x <- df[[nm]]
+
+    if (is.factor(proto)) {
+      lv <- levels(proto)
+      if (is.numeric(x) || is.integer(x) || is.logical(x)) x <- to_bin_char(x)
+      x <- trimws(as.character(x))
+      if (length(lv) == 2L) {
+        low <- lv[1]; high <- lv[2]
+        if (all(c("0","1") %in% lv)) {
+          x <- ifelse(x %in% c("0","1"), x, NA_character_)
+        } else {
+          x <- ifelse(x == "0", low, ifelse(x == "1", high, x))
+        }
+      }
+      df[[nm]] <- factor(ifelse(x %in% lv, x, NA_character_), levels = lv)
+
+    } else if (is.numeric(proto)) {
+      if (!is.numeric(x)) df[[nm]] <- suppressWarnings(as.numeric(x))
+
+    } else if (is.integer(proto)) {
+      if (!is.integer(x)) df[[nm]] <- suppressWarnings(as.integer(x))
+
+    } else if (is.logical(proto)) {
+      if (!is.logical(x)) {
+        xl <- tolower(as.character(x))
+        df[[nm]] <- xl %in% c("1","true","t","yes","y")
+      }
+
+    } else if (is.character(proto)) {
+      if (!is.character(x)) df[[nm]] <- as.character(x)
+    }
+  }
+
+  df
+}
+
 
 # --- Shared bake-once + sparse builders (top-level) --------------------
 # Re-usable helpers so we don't duplicate inside predict_s2_probs()
@@ -329,38 +367,6 @@ build_sparse_for <- function(baked, features) {
     colnames(X) <- ".bias0"
   }
   X
-}
-
-  for (nm in names(ptypes)) {
-    proto <- ptypes[[nm]]
-    x <- df[[nm]]
-    if (is.factor(proto)) {
-      lv <- levels(proto)
-      if (is.numeric(x) || is.integer(x) || is.logical(x)) x <- to_bin_char(x)
-      x <- trimws(as.character(x))
-      if (length(lv) == 2L) {
-        low <- lv[1]; high <- lv[2]
-        if (all(c("0","1") %in% lv)) {
-          x <- ifelse(x %in% c("0","1"), x, NA_character_)
-        } else {
-          x <- ifelse(x == "0", low, ifelse(x == "1", high, x))
-        }
-      }
-      df[[nm]] <- factor(ifelse(x %in% lv, x, NA_character_), levels = lv)
-    } else if (is.numeric(proto)) {
-      if (!is.numeric(x)) df[[nm]] <- suppressWarnings(as.numeric(x))
-    } else if (is.integer(proto)) {
-      if (!is.integer(x)) df[[nm]] <- suppressWarnings(as.integer(x))
-    } else if (is.logical(proto)) {
-      if (!is.logical(x)) {
-        xl <- tolower(as.character(x))
-        df[[nm]] <- xl %in% c("1","true","t","yes","y")
-      }
-    } else if (is.character(proto)) {
-      if (!is.character(x)) df[[nm]] <- as.character(x)
-    }
-  }
-  df
 }
 
 predict_s2_probs <- function(fit, new_data, calibrated = TRUE) {

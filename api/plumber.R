@@ -193,6 +193,7 @@ suppressPackageStartupMessages({
   library(recipes)
   library(Matrix)
   library(xgboost)
+  library(tibble)
 })
 
 is_trained_wf <- function(x) {
@@ -366,6 +367,8 @@ build_sparse_for <- function(baked, features) {
     X <- Matrix::Matrix(0, nrow = nrow(baked), ncol = 1, sparse = TRUE)
     colnames(X) <- ".bias0"
   }
+  .log(sprintf("s2_infer: build_sparse_for -> baked dims: %d x %d; need %d feats",
+             nrow(baked), ncol(baked), length(features)))
   X
 }
 
@@ -886,7 +889,10 @@ function(req, res) {
   }
 
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
-  feats_in <- as.data.frame(body$features, stringsAsFactors = FALSE)
+  feats_in <- tryCatch(
+    tibble::as_tibble_row(body$features),
+    error = function(e) as.data.frame(body$features, stringsAsFactors = FALSE)
+    )
   if (!nrow(feats_in)) feats_in <- feats_in[NA, , drop = FALSE]
   if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
@@ -966,6 +972,23 @@ thr3   <- get_thr(v3_fit, v3_meta, 0.50)
 # Bake ONCE with v3 recipe (covers indicate_na, bagged impute, dummies, etc.)
 .log("s2_infer: baking once via v3 recipe")
 baked_once <- bake_once_with(v3_fit, feats_in)
+
+# Sanity check after bake
+.log(sprintf("s2_infer: nrow feats_in=%s, nrow baked=%s, ncol baked=%s",
+             nrow(feats_in), nrow(baked_once), ncol(baked_once)))
+
+if (nrow(baked_once) == 0L) {
+  res$status <- 400
+  return(list(
+    error = "empty_baked_frame",
+    note  = "Recipe returned 0 rows; cannot score.",
+    nrow_feats_in   = nrow(feats_in),
+    names_in_request = names(feats_in),
+    ncol_baked      = ncol(baked_once),
+    baked_colnames  = names(baked_once),
+    need_features   = head(v3_fit$features, 20L)
+  ))
+}
 
 # Predict v3 using reused baked data
 .log("s2_infer: predicting v3")

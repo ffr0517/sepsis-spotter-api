@@ -6,21 +6,6 @@ library(workflows)
 library(rlang)
 library(vctrs)
 
-
-
-limit_threads <- function() {
-  # BLAS/OpenMP families
-  Sys.setenv(
-    OMP_NUM_THREADS = "1",
-    OPENBLAS_NUM_THREADS = "1",
-    MKL_NUM_THREADS = "1",
-    VECLIB_MAXIMUM_THREADS = "1",
-    NUMEXPR_NUM_THREADS = "1",
-    XGBOOST_NUM_THREADS = "1"
-  )
-}
-limit_threads()
-
 # Control model caching for low-RAM instances
 CACHE_MODELS <- tolower(Sys.getenv("CACHE_MODELS", "true")) %in% c("1","true","t","yes","y")
 

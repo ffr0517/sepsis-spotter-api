@@ -1088,6 +1088,7 @@ p5_raw <- predict(v5_fit$bst, newdata = as.matrix(X5), nthread = 1)
 rm(X5); gc(FALSE)
 p5 <- if (isTRUE(use_cal)) apply_calibrator(p5_raw, v5_fit$calibrator) else p5_raw
 rm(p5_raw); if (!CACHE_MODELS) release_fit("v5"); rm(v5_fit); gc()
+rm(baked_once); gc(FALSE); gc(TRUE)
 
   # ---------- routing ----------
   .log("s2_infer: routing results")

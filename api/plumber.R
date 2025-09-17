@@ -876,7 +876,7 @@ return(resp)
 # ---------------------------------------------------------------------
 #* @post /s2_infer
 function(req, res) {
-  .log("s2_infer: start (memory-efficient mode)")
+  .log("s2_infer: start (memory-efficient mode v2)")
 
   body <- jsonlite::fromJSON(req$postBody, simplifyVector = TRUE)
   feats_in <- tryCatch(
@@ -887,16 +887,48 @@ function(req, res) {
   if (!"label" %in% names(feats_in)) feats_in$label <- sprintf("row_%s", seq_len(nrow(feats_in)))
   use_cal <- isTRUE(body$apply_calibration) || is.null(body$apply_calibration)
 
-  # --- This block runs the full cycle for one model and cleans up ---
+  # ----------------- RE-INTEGRATED PADDING BLOCK (FROM ORIGINAL CODE) ----------------- #
+  n <- nrow(feats_in)
+  add_if_missing <- function(df, nm, val) { if (!nm %in% names(df)) df[[nm]] <- val; df }
+  feats_in <- add_if_missing(feats_in, "w_final", rep(1, n))
+  feats_in <- add_if_missing(feats_in, ".case_w", rep(1, n))
+
+  lvl_sev  <- c("Other","Severe")
+  lvl_psev <- c("Other","Probable Severe")
+  lvl_pns  <- c("Other","Probable Non-Severe")
+  if (!"SFI_bin_severe_vs_other" %in% names(feats_in))
+    feats_in$SFI_bin_severe_vs_other <- factor(rep("Other", n), levels = lvl_sev)
+  if (!"SFI_bin_probSev_vs_other" %in% names(feats_in))
+    feats_in$SFI_bin_probSev_vs_other <- factor(rep("Other", n), levels = lvl_psev)
+  if (!"SFI_bin_probNS_vs_other" %in% names(feats_in))
+    feats_in$SFI_bin_probNS_vs_other  <- factor(rep("Other", n), levels = lvl_pns)
+
+  for (nm in S2_REQUIRED_STUB_COLS) {
+    if (!nm %in% names(feats_in)) {
+      feats_in[[nm]] <- NA_real_
+    }
+  }
+
+  factorish <- c("site","ipdopd","sex","bgcombyn","adm.recent","waste","stunt",
+                 "prior.care","travel.time.bin","urti","lrti","diarrhoeal","neuro",
+                 "auf","ensapro","vomit.all","seiz","pfacleth","parenteral_screen","SFI_5cat")
+  for (nm in intersect(factorish, names(feats_in))) {
+    if (!is.factor(feats_in[[nm]])) feats_in[[nm]] <- factor(feats_in[[nm]])
+  }
+
+  miss_pred <- setdiff(S2_PREDICTORS, names(feats_in))
+  if (length(miss_pred)) for (nm in miss_pred) feats_in[[nm]] <- NA
+  # -------------------------------- END PADDING BLOCK --------------------------------- #
+
   run_model_cycle <- function(version, path, meta) {
     .log(sprintf("s2_infer: processing %s", version))
     
     fit <- get_fit(version, path)
-    baked <- bake_once_with(fit, feats_in)
+    # The 'feats_in' object now has the correct schema thanks to the block above
+    baked <- bake_once_with(fit, feats_in) 
     X <- build_dense_for(baked, fit$features)
     
     if (all(X == 0)) {
-      # This stops execution inside this block
       stop(sprintf("all_zero_feature_vector_for_%s", version))
     }
     
@@ -905,7 +937,6 @@ function(req, res) {
     p_final <- if (isTRUE(use_cal)) apply_calibrator(p_raw, fit$calibrator) else p_raw
     thr <- get_thr(fit, meta, 0.50)
     
-    # Immediately clean up all large objects from this cycle
     rm(fit, baked, X, X_aligned, p_raw)
     if (!CACHE_MODELS) release_fit(version)
     gc(verbose = FALSE)
@@ -913,22 +944,13 @@ function(req, res) {
     list(p = p_final, thr = thr)
   }
 
-  # Use a tryCatch to handle errors like all-zero vectors gracefully
   results <- tryCatch({
-    # --- v3 Cycle ---
     v3_results <- run_model_cycle("v3", V3_PATH, v3_meta)
-
-    # --- v4 Cycle ---
     v4_results <- run_model_cycle("v4", V4_PATH, v4_meta)
-
-    # --- v5 Cycle ---
     v5_results <- run_model_cycle("v5", V5_PATH, v5_meta)
-    
     list(v3 = v3_results, v4 = v4_results, v5 = v5_results)
-    
   }, error = function(e) {
     .log("s2_infer: encountered an error during prediction cycle -> ", conditionMessage(e))
-    # Check for our specific all-zero error
     if (grepl("all_zero_feature_vector", conditionMessage(e), fixed = TRUE)) {
       res$status <- 422
       return(list(
@@ -937,17 +959,14 @@ function(req, res) {
         source_error = conditionMessage(e)
       ))
     }
-    # For other errors, return a generic 500
     res$status <- 500
     return(list(error = "internal_server_error", message = conditionMessage(e)))
   })
   
-  # If the tryCatch block returned an error response, stop here.
   if ("error" %in% names(results)) {
     return(results)
   }
 
-  # ---------- routing ----------
   .log("s2_infer: routing results")
   p3 <- results$v3$p; thr3 <- results$v3$thr
   p4 <- results$v4$p; thr4 <- results$v4$thr

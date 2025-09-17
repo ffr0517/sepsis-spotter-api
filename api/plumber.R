@@ -995,6 +995,19 @@ thr3   <- get_thr(v3_fit, v3_meta, 0.50)
 .log("s2_infer: baking once via v3 recipe")
 baked_once <- bake_once_with(v3_fit, feats_in)
 
+# DEBUG STEP (TEMPORARY)
+.log("DEBUG START: Feature Name Comparison for v3")
+baked_names <- names(baked_once)
+expected_names <- v3_fit$features
+in_both <- intersect(baked_names, expected_names)
+only_in_baked <- setdiff(baked_names, expected_names)
+only_in_expected <- setdiff(expected_names, baked_names)
+
+.log("DEBUG: Features present in BOTH (first 10): ", paste(head(in_both, 10), collapse=", "))
+.log("DEBUG: Features ONLY in recipe output (first 10): ", paste(head(only_in_baked, 10), collapse=", "))
+.log("DEBUG: Features ONLY in model's list (first 10): ", paste(head(only_in_expected, 10), collapse=", "))
+.log("DEBUG END: Feature Name Comparison for v3")
+
 # Which meta-probs does v3 actually use?
 meta_in_v3 <- intersect(v3_fit$features,
                         c("v1_pred_Severe","v1_pred_Other","v2_pred_NOTSevere","v2_pred_Other"))
@@ -1026,7 +1039,7 @@ if (nrow(baked_once) == 0L) {
 # Predict v3 using reused baked data
 .log("s2_infer: predicting v3")
 X3 <- build_dense_for(baked_once, v3_fit$features)
-if (length(X3@x) == 0L) {
+if (all(X3 == 0)) {
   res$status <- 422
   return(list(
     error = "all_zero_feature_vector",
@@ -1047,7 +1060,7 @@ rm(p3_raw); if (!CACHE_MODELS) release_fit("v3"); rm(v3_fit); gc()
 v4_fit <- get_fit("v4", V4_PATH); thr4 <- get_thr(v4_fit, v4_meta, 0.50)
 .log("s2_infer: predicting v4 (reuse baked)")
 X4 <- build_dense_for(baked_once, v4_fit$features)
-if (length(X4@x) == 0L) {
+if (all(X4 == 0)) {
   res$status <- 422
   return(list(
     error = "all_zero_feature_vector",
@@ -1068,7 +1081,7 @@ rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
 v5_fit <- get_fit("v5", V5_PATH); thr5 <- get_thr(v5_fit, v5_meta, 0.50)
 .log("s2_infer: predicting v5 (reuse baked)")
 X5 <- build_dense_for(baked_once, v5_fit$features)
-if (length(X5@x) == 0L) {
+if (all(X5 == 0)) {
   res$status <- 522
   return(list(
     error = "all_zero_feature_vector",

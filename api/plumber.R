@@ -230,11 +230,14 @@ apply_calibrator <- function(p_raw, calib, eps = 1e-6) {
 cast_to_ptypes <- function(df, ptypes) {
   df <- as.data.frame(df, stringsAsFactors = FALSE)
   n <- nrow(df)
+
   # Add missing predictors
   miss <- setdiff(names(ptypes), names(df))
-  if (length(miss)) for (nm in miss) df[[nm]] <- vctrs::vec_init(ptypes[[nm]], n)
+  if (length(miss)) {
+    for (nm in miss) df[[nm]] <- vctrs::vec_init(ptypes[[nm]], n)
+  }
 
-  # Cast existing to prototype classes
+  # Helper to normalize many binary encodings to "0"/"1"
   to_bin_char <- function(x) {
     if (is.factor(x)) x <- as.character(x)
     if (is.logical(x)) return(ifelse(isTRUE(x), "1", "0"))
@@ -243,37 +246,7 @@ cast_to_ptypes <- function(df, ptypes) {
       ifelse(x %in% c("0","false","f","no","n","female","fem"), "0", x))
   }
 
-  for (nm in names(ptypes)) {
-    proto <- ptypes[[nm]]
-    x <- df[[nm]]
-    if (is.factor(proto)) {
-      lv <- levels(proto)
-      if (is.numeric(x) || is.integer(x) || is.logical(x)) x <- to_bin_char(x)
-      x <- trimws(as.character(x))
-      if (length(lv) == 2L) {
-        low <- lv[1]; high <- lv[2]
-        if (all(c("0","1") %in% lv)) {
-          x <- ifelse(x %in% c("0","1"), x, NA_character_)
-        } else {
-          x <- ifelse(x == "0", low, ifelse(x == "1", high, x))
-        }
-      }
-      df[[nm]] <- factor(ifelse(x %in% lv, x, NA_character_), levels = lv)
-    } else if (is.numeric(proto)) {
-      if (!is.numeric(x)) df[[nm]] <- suppressWarnings(as.numeric(x))
-    } else if (is.integer(proto)) {
-      if (!is.integer(x)) df[[nm]] <- suppressWarnings(as.integer(x))
-    } else if (is.logical(proto)) {
-      if (!is.logical(x)) {
-        xl <- tolower(as.character(x))
-        df[[nm]] <- xl %in% c("1","true","t","yes","y")
-      }
-    } else if (is.character(proto)) {
-      if (!is.character(x)) df[[nm]] <- as.character(x)
-    }
-  }
-  df
-}
+  # Cast existing to prototype classes
 
 # --- Shared bake-once + sparse builders (top-level) --------------------
 # Re-usable helpers so we don't duplicate inside predict_s2_probs()
@@ -304,7 +277,7 @@ bake_once_with <- function(fit, new_data) {
         new_data[[nm]] <- rep(NA_character_, n)
       } else if (grepl("^(urti|lrti|neuro|auf|prop_handoff)$", nm)) {
         new_data[[nm]] <- rep(NA_integer_, n)
-      } else if (grepl("^syndrome\.(resp|nonresp)$", nm)) {
+      } else if (grepl("^syndrome\\.(resp|nonresp)$", nm)) {
         new_data[[nm]] <- rep(NA_integer_, n)
       } else if (grepl("^(ipw|LqSOFA)$", nm)) {
         new_data[[nm]] <- rep(NA_real_, n)
@@ -1034,6 +1007,7 @@ rm(p5_raw); if (!CACHE_MODELS) release_fit("v5"); rm(v5_fit); gc()
   jsonlite::toJSON(resp, dataframe = "rows", auto_unbox = TRUE, na = "null")
   return(resp)
 }
+
 
 
 

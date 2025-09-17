@@ -767,6 +767,15 @@ function() {
 # ---------------------------------------------------------------------
 #* @post /s1_infer
 function(req, res) {
+  on.exit({
+    if (!CACHE_MODELS) {
+      release_fit("v1")
+      release_fit("v2")
+    }
+    gc(verbose = FALSE) # Force garbage collection
+    .log("s1_infer: Cleaned up S1 models.")
+  }, add = TRUE)
+
   # Lazy-load S1 models
   v1_obj <- get_fit("v1", V1_PATH)
   v2_obj <- get_fit("v2", V2_PATH)
@@ -776,7 +785,7 @@ function(req, res) {
   # Ensure at least a 1-row frame
   if (!nrow(feats_in)) feats_in <- feats_in[NA, , drop = FALSE]
 
-  # Align request schema to both workflows (adds missing cols, casts types)
+  # Align request schema to both workflows
   feats <- ensure_predictor_schema(list(v1_obj, v2_obj), feats_in)
   feats <- add_role_stubs(v1_obj, feats)
   feats <- add_role_stubs(v2_obj, feats)
@@ -821,7 +830,7 @@ function(req, res) {
     v1_strong = eff_v1_strong, low_v2_rescue = eff_low_v2_rescue
   )
 
-  # Minimal info sheet (first row only, for demo)
+  # Minimal info sheet
   sheet <- list(
     sheet_version = 1L,
     created_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
@@ -858,7 +867,7 @@ function(req, res) {
   hash = "sha256:s1",
   timing_ms = 0L
 )
-return(resp)  
+return(resp)
 }
 
 .align_for_booster_matrix <- function(M, booster, fallback_names = NULL) {

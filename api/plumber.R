@@ -987,6 +987,17 @@ thr3   <- get_thr(v3_fit, v3_meta, 0.50)
 .log("s2_infer: baking once via v3 recipe")
 baked_once <- bake_once_with(v3_fit, feats_in)
 
+# Which meta-probs does v3 actually use?
+meta_in_v3 <- intersect(v3_fit$features,
+                        c("v1_pred_Severe","v1_pred_Other","v2_pred_NOTSevere","v2_pred_Other"))
+.log(paste("s2_infer: v3 uses meta probs ->", paste(meta_in_v3, collapse=", ")))
+
+# Do we have a 1 in the not.alert dummy?
+.log(paste("s2_infer: has not.alert_X1 in baked:", "not.alert_X1" %in% names(baked_once)))
+if ("not.alert_X1" %in% names(baked_once)) {
+  .log(paste("s2_infer: not.alert_X1 value =", baked_once$not.alert_X1[1]))
+}
+
 # Sanity check after bake
 .log(sprintf("s2_infer: nrow feats_in=%s, nrow baked=%s, ncol baked=%s",
              nrow(feats_in), nrow(baked_once), ncol(baked_once)))
@@ -1007,6 +1018,20 @@ if (nrow(baked_once) == 0L) {
 # Predict v3 using reused baked data
 .log("s2_infer: predicting v3")
 X3 <- build_sparse_for(baked_once, v3_fit$features)
+nnz3 <- if (inherits(X3, "dgCMatrix")) length(X3@x) else sum(X3 != 0)
+if (nnz3 == 0L) {
+  res$status <- 422
+  return(list(
+    error = "all_zero_feature_vector",
+    note  = "After recipe and alignment to v3 features, this row has no non-zero entries; model cannot score.",
+    suggest = list(
+      set_any_of_binary_flags_to_1 = c("not.alert","danger.sign","pneumo","ensapro","vomit.all"),
+      include_any_lab_with_value   = c("CRP","IL6","supar","ANG1","..."),
+      or_include_meta_probs        = c("v1_pred_Severe","v2_pred_NOTSevere")
+    ),
+    present_feature_cols = head(v3_fit$features, 20L)
+  ))
+}
 p3_raw <- predict(v3_fit$bst, newdata = X3, nthread = 1); rm(X3); gc(FALSE)
 p3 <- if (isTRUE(use_cal)) apply_calibrator(p3_raw, v3_fit$calibrator) else p3_raw
 
@@ -1018,6 +1043,20 @@ rm(p3_raw); if (!CACHE_MODELS) release_fit("v3"); rm(v3_fit); gc()
 v4_fit <- get_fit("v4", V4_PATH); thr4 <- get_thr(v4_fit, v4_meta, 0.50)
 .log("s2_infer: predicting v4 (reuse baked)")
 X4 <- build_sparse_for(baked_once, v4_fit$features)
+nnz4 <- if (inherits(X4, "dgCMatrix")) length(X4@x) else sum(X4 != 0)
+if (nnz4 == 0L) {
+  res$status <- 422
+  return(list(
+    error = "all_zero_feature_vector",
+    note  = "After recipe and alignment to v4 features, this row has no non-zero entries; model cannot score.",
+    suggest = list(
+      set_any_of_binary_flags_to_1 = c("not.alert","danger.sign","pneumo","ensapro","vomit.all"),
+      include_any_lab_with_value   = c("CRP","IL6","supar","ANG1","..."),
+      or_include_meta_probs        = c("v1_pred_Severe","v2_pred_NOTSevere")
+    ),
+    present_feature_cols = head(v4_fit$features, 20L)
+  ))
+}
 p4_raw <- predict(v4_fit$bst, newdata = X4, nthread = 1); rm(X4); gc(FALSE)
 p4 <- if (isTRUE(use_cal)) apply_calibrator(p4_raw, v4_fit$calibrator) else p4_raw
 rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
@@ -1027,6 +1066,20 @@ rm(p4_raw); if (!CACHE_MODELS) release_fit("v4"); rm(v4_fit); gc()
 v5_fit <- get_fit("v5", V5_PATH); thr5 <- get_thr(v5_fit, v5_meta, 0.50)
 .log("s2_infer: predicting v5 (reuse baked)")
 X5 <- build_sparse_for(baked_once, v5_fit$features)
+nnz5 <- if (inherits(X5, "dgCMatrix")) length(X5@x) else sum(X5 != 0)
+if (nnz5 == 0L) {
+  res$status <- 422
+  return(list(
+    error = "all_zero_feature_vector",
+    note  = "After recipe and alignment to v5 features, this row has no non-zero entries; model cannot score.",
+    suggest = list(
+      set_any_of_binary_flags_to_1 = c("not.alert","danger.sign","pneumo","ensapro","vomit.all"),
+      include_any_lab_with_value   = c("CRP","IL6","supar","ANG1","..."),
+      or_include_meta_probs        = c("v1_pred_Severe","v2_pred_NOTSevere")
+    ),
+    present_feature_cols = head(v5_fit$features, 20L)
+  ))
+}
 p5_raw <- predict(v5_fit$bst, newdata = X5, nthread = 1); rm(X5); gc(FALSE)
 p5 <- if (isTRUE(use_cal)) apply_calibrator(p5_raw, v5_fit$calibrator) else p5_raw
 rm(p5_raw); if (!CACHE_MODELS) release_fit("v5"); rm(v5_fit); gc()

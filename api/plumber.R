@@ -89,10 +89,6 @@ v5_meta <- get_meta("v5_meta", "models/v5_meta.rds")
 # ---------------------------------------------------------------------
 DEF_THR_V1        <- 0.025
 DEF_THR_V2        <- 0.20
-DEF_MARGIN        <- 0.05
-DEF_VETO_SOFT     <- 0.10
-DEF_V1_STRONG     <- 0.20
-DEF_LOW_V2_RESCUE <- 0.01
 
 get_num <- function(x, default) {
   xnum <- suppressWarnings(as.numeric(x))
@@ -638,39 +634,27 @@ ensure_predictor_schema <- function(models, new_data) {
 # ---------------------------------------------------------------------
 # Decision logic (margin + soft veto + strong V1 + low-V2 rescue)
 # ---------------------------------------------------------------------
-combine_margin <- function(p1, p2,
-                           thr_v1        = eff_thr_v1,
-                           thr_v2        = eff_thr_v2,
-                           margin        = eff_margin,
-                           veto_soft     = eff_veto_soft,
-                           v1_strong     = eff_v1_strong,
-                           low_v2_rescue = eff_low_v2_rescue) {
+combine_thresholds <- function(p1, p2,
+                               thr_v1 = eff_thr_v1,
+                               thr_v2 = eff_thr_v2) {
   n <- length(p1)
-  out  <- rep("Other", n)
-  rule <- rep("other_default", n)
+  call_severe <- !is.na(p1) & (p1 >= thr_v1)
+  call_notsev <- !is.na(p2) & (p2 >= thr_v2)
 
-  # 1) NOTSevere by V2 threshold
-  idx_notsev <- p2 >= thr_v2
-  out[idx_notsev]  <- "NOTSevere"
-  rule[idx_notsev] <- "v2>=thr_v2"
+  # Priority:
+  # - Severe if only v1 crosses
+  # - NOTSevere if only v2 crosses
+  # - "Other" if both cross (conflict) OR neither crosses
+  decision <- ifelse(call_severe & !call_notsev, "Severe",
+              ifelse(!call_severe & call_notsev, "NOTSevere", "Other"))
 
-  # 2) Severe by V1 + margin + veto/override (only where not already NOTSevere)
-  idx_cand <- !idx_notsev &
-    (p1 >= thr_v1) &
-    ((p1 - p2) >= margin) &
-    ( (p2 < veto_soft) | (p1 >= v1_strong) | (p2 < low_v2_rescue) )
-
-  out[idx_cand]  <- "Severe"
-  rule[idx_cand] <- dplyr::case_when(
-    p2[idx_cand] < low_v2_rescue ~ "severe_low_v2_rescue",
-    p1[idx_cand] >= v1_strong    ~ "severe_v1_strong",
-    p2[idx_cand] < veto_soft     ~ "severe_v2_soft_veto",
-    TRUE                         ~ "severe_margin"
-  )
+  rule <- ifelse(call_severe & !call_notsev, "v1>=thr_v1",
+          ifelse(!call_severe & call_notsev, "v2>=thr_v2",
+          ifelse(call_severe & call_notsev, "conflict_both", "neither_meet")))
 
   list(
-    decision = factor(out, levels = c("Other","Severe","NOTSevere")),
-    rule     = rule
+    decision = factor(decision, levels = c("Other","Severe","NOTSevere")),
+    rule = rule
   )
 }
 
@@ -727,17 +711,12 @@ function() list(
   ok = TRUE,
   service = "S1+S2",
   defaults = list(
-    thr_v1        = eff_thr_v1,
-    thr_v2        = eff_thr_v2,
-    margin        = eff_margin,
-    veto_soft     = eff_veto_soft,
-    v1_strong     = eff_v1_strong,
-    low_v2_rescue = eff_low_v2_rescue,
-    # S2 thresholds from meta only (won't load models):
-    thr_v3        = if (!is.null(v3_meta$threshold)) as.numeric(v3_meta$threshold) else NA_real_,
-    thr_v4        = if (!is.null(v4_meta$threshold)) as.numeric(v4_meta$threshold) else NA_real_,
-    thr_v5        = if (!is.null(v5_meta$threshold)) as.numeric(v5_meta$threshold) else NA_real_
-  ),
+    thr_v1 = eff_thr_v1,
+    thr_v2 = eff_thr_v2,
+    thr_v3 = if (!is.null(v3_meta$threshold)) as.numeric(v3_meta$threshold) else NA_real_,
+    thr_v4 = if (!is.null(v4_meta$threshold)) as.numeric(v4_meta$threshold) else NA_real_,
+    thr_v5 = if (!is.null(v5_meta$threshold)) as.numeric(v5_meta$threshold) else NA_real_
+    ),
   s2_models_loaded = list(
     v3 = is_loaded("v3"),
     v4 = is_loaded("v4"),
@@ -825,12 +804,10 @@ function(req, res) {
   v2_prob <- p2$.pred_NOTSevere
 
   # Decision
-  cmb <- combine_margin(
-    p1 = v1_prob, p2 = v2_prob,
-    thr_v1 = eff_thr_v1, thr_v2 = eff_thr_v2,
-    margin = eff_margin, veto_soft = eff_veto_soft,
-    v1_strong = eff_v1_strong, low_v2_rescue = eff_low_v2_rescue
-  )
+  cmb <- combine_thresholds(
+  p1 = v1_prob, p2 = v2_prob,
+  thr_v1 = eff_thr_v1, thr_v2 = eff_thr_v2
+)
 
   # Minimal info sheet
   sheet <- list(
@@ -844,12 +821,9 @@ function(req, res) {
       v2 = list(prob = unname(v2_prob[1]), thr = eff_thr_v2),
       decision = as.character(cmb$decision[1]),
       rule = cmb$rule[1],
-      params = list(
-        margin = eff_margin, veto_soft = eff_veto_soft,
-        v1_strong = eff_v1_strong, low_v2_rescue = eff_low_v2_rescue
-      ),
+      params = list(mode = "thr_only_conflict=Other"),
       model_hash = "sha256:s1"
-    ),
+      ),
     notes = list()
   )
 

@@ -173,10 +173,6 @@ get_thr <- function(fit, meta, default = 0.5) {
 
 eff_thr_v1        <- get_num(v1_meta$threshold,        DEF_THR_V1)
 eff_thr_v2        <- get_num(v2_meta$threshold,        DEF_THR_V2)
-eff_margin        <- get_num(v1_meta$margin,           DEF_MARGIN)
-eff_veto_soft     <- get_num(v2_meta$veto_soft,        DEF_VETO_SOFT)
-eff_v1_strong     <- get_num(v1_meta$v1_strong,        DEF_V1_STRONG)
-eff_low_v2_rescue <- get_num(v2_meta$low_v2_rescue,    DEF_LOW_V2_RESCUE)
 
 # ---------------------------------------------------------------------
 # Workflow helpers

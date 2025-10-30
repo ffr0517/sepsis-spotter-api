@@ -8,7 +8,7 @@
 # Sepsis Spotter API Repository
 
 The Sepsis Spotter API is a **research-focused REST service** that provides machine learning–based predictions of pediatric sepsis severity.  
-It is implemented in **R (via Plumber)**, containerized with **Docker**, and distributed for **evaluation, validation, and experimental use only** — not for clinical deployment.
+It is implemented in **R (via Plumber)**, containerized with **Docker**, and currently distributed for **evaluation, validation, and experimental use only** - not for clinical deployment.
 
 ---
 

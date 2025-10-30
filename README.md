@@ -148,12 +148,12 @@ Environment variables such as `CACHE_MODELS`, `MODEL_PATH`, and `OMP_NUM_THREADS
 spot-sepsis-api/
 ├── README.md
 ├── api/
-│   ├── plumber.R          # Core API definition
-│   ├── Dockerfile         # Containerized runtime
-│   └── models/            # Model artefacts (legacy)
-├── api_demo_script.R      # Example interaction script
-├── sepsis-spotter-api.yaml# OpenAPI 3.1 specification
-└── privacy_policy.md      # Data and privacy documentation
+│   ├── plumber.R # Core API definition
+│   ├── Dockerfile # Containerized runtime
+│   └── models/ # Model artefacts (legacy)
+├── api_demo_script.R # Example interaction script
+├── sepsis-spotter-api.yaml # OpenAPI 3.1 specification
+└── privacy_policy.md # Data and privacy documentation
 ```
 
 ---

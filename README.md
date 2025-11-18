@@ -117,7 +117,7 @@ This API will be updated after the `spot-sepsis-build` repository finalizes its 
 
 ## Privacy and Data Handling
 
-- All data are processed transiently in memory — no storage, persistence, or analytics logging.
+- All data are processed transiently in memory; no storage, persistence, or analytics logging.
 - The API does not attempt to identify users or link submissions across sessions.
 - Deployed instances should be hosted behind institution-managed security layers (e.g., HTTPS reverse proxy, authentication).
 - See `privacy_policy.md` for full details on data handling, encryption expectations, and deployer responsibilities.
@@ -152,7 +152,7 @@ spot-sepsis-api/
 │   ├── Dockerfile # Containerized runtime
 │   └── models/ # Model artefacts (legacy)
 ├── api_demo_script.R # Example interaction script
-├── sepsis-spotter-api.yaml # OpenAPI 3.1 specification
+├── sepsis-spotter-api.yaml 
 └── privacy_policy.md # Data and privacy documentation
 ```
 
